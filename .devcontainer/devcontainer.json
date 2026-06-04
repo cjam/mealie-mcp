@@ -1,0 +1,37 @@
+{
+  "name": "mealie-mcp",
+  "image": "mcr.microsoft.com/devcontainers/python:3.12-bookworm",
+  "features": {
+    "ghcr.io/va-h/devcontainers-features/uv:1": {},
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {
+      "version": "latest",
+      "moby": true
+    }
+  },
+  "forwardPorts": [8000],
+  "mounts": [
+  "source=claude-code-config,target=/home/node/.claude,type=volume"
+],
+  "portsAttributes": {
+    "8000": {
+      "label": "MCP (streamable-http)",
+      "onAutoForward": "notify"
+    }
+  },
+  "remoteEnv": {
+    "MCP_HOST": "0.0.0.0",
+    "MCP_PORT": "8000"    
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "charliermarsh.ruff",
+        "anthropic.claude-code"
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": ".venv/bin/python"
+      }
+    }
+  }
+}

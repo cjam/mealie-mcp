@@ -1,0 +1,21 @@
+# Deploy on the NAS. Point MEALIE_BASE_URL at your existing Mealie instance.
+services:
+  mealie-mcp:
+    build: .
+    # Or pull a prebuilt image instead of building on the NAS:
+    # image: ghcr.io/cjam/mealie-mcp:latest
+    container_name: mealie-mcp
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      MEALIE_BASE_URL: ${MEALIE_BASE_URL}
+      MEALIE_API_TOKEN: ${MEALIE_API_TOKEN}
+      MCP_TRANSPORT: http
+      LOG_LEVEL: INFO
+    # If Mealie runs in the same compose/network, reference it by service name
+    # in MEALIE_BASE_URL (e.g. http://mealie:9000) and add:
+    # networks: [mealie-net]
+# networks:
+#   mealie-net:
+#     external: true
