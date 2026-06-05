@@ -360,6 +360,13 @@ async def _cleanup_recipe_impl(client: httpx.AsyncClient, recipe_slug: str) -> s
         lines.append(f"  Patching recipe ({changes} references resolved)…")
         ok = await _put_recipe(client, recipe_slug, recipe)
         lines.append("  " + ("PATCH OK" if ok else "WARN: patch failed — check Mealie logs"))
+        if ok:
+            # Mealie regenerates step IDs on PUT — re-fetch to get the current IDs.
+            try:
+                recipe = await _get_recipe(client, recipe_slug)
+                ingredients = recipe.get("recipeIngredient") or []
+            except Exception:
+                pass
     else:
         lines.append("  All ingredient references already linked; no changes needed.")
 
@@ -595,6 +602,60 @@ def register_cleanup_tools(mcp: Any, client: httpx.AsyncClient) -> None:
             listing of ingredient referenceIds and step IDs for step linking.
         """
         return await _cleanup_recipe_impl(client, recipe_slug)
+
+    @mcp.tool()
+    async def link_recipe_steps(recipe_slug: str, step_ingredient_map: dict[str, list[str]]) -> str:
+        """
+        Set ingredient references on recipe instruction steps.
+
+        Call this after cleanup_recipe once you have decided which ingredients
+        belong to each step. It fetches the recipe, applies your mapping, and
+        PUTs it back.
+
+        Args:
+            recipe_slug: The recipe slug (same value passed to cleanup_recipe).
+            step_ingredient_map: Dict mapping each step ID to the list of
+                ingredient referenceIds that appear in that step. Steps omitted
+                from the map are left unchanged. Pass an empty list for a step
+                to clear its references.
+
+        Returns:
+            Plain-text summary of every step updated and the final PATCH status.
+        """
+        try:
+            recipe = await _get_recipe(client, recipe_slug)
+        except Exception as exc:
+            return f"ERROR: could not fetch recipe '{recipe_slug}': {exc}"
+
+        recipe_name = recipe.get("name", recipe_slug)
+        lines: list[str] = [f"=== Step Linking: {recipe_name} ===", ""]
+
+        steps: list[dict] = recipe.get("recipeInstructions") or []
+        applied = 0
+        unknown_steps = set(step_ingredient_map) - {s["id"] for s in steps}
+        if unknown_steps:
+            for sid in sorted(unknown_steps):
+                lines.append(f"  WARN: step ID not found in recipe — {sid}")
+
+        for step in steps:
+            sid = step.get("id")
+            if sid not in step_ingredient_map:
+                continue
+            ref_ids = step_ingredient_map[sid]
+            step["ingredientReferences"] = [{"referenceId": r} for r in ref_ids]
+            text_preview = (step.get("text") or "")[:80].replace("\n", " ")
+            lines.append(f"  [{sid}]  {len(ref_ids)} reference(s) → {text_preview}…")
+            applied += 1
+
+        lines.append("")
+        if applied:
+            ok = await _put_recipe(client, recipe_slug, recipe)
+            lines.append(f"  Applied {applied} step(s). " + ("PATCH OK" if ok else "WARN: patch failed — check Mealie logs"))
+        else:
+            lines.append("  No matching steps found — nothing written.")
+
+        lines.append("\n=== Done ===")
+        return "\n".join(lines)
 
     @mcp.tool()
     async def import_and_cleanup_recipe(url: str) -> str:

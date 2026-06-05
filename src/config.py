@@ -42,11 +42,10 @@ def _require(name: str) -> str:
 def load_settings() -> Settings:
     """Build Settings from the environment, validating required fields."""
     base_url = _require("MEALIE_BASE_URL").rstrip("/")
-    token = _require("MEALIE_API_TOKEN")
 
     return Settings(
         mealie_base_url=base_url,
-        mealie_api_token=token,
+        mealie_api_token=os.environ.get("MEALIE_API_TOKEN", "").strip(),
         host=os.environ.get("MCP_HOST", "0.0.0.0"),
         port=int(os.environ.get("MCP_PORT", "8000")),
         transport=os.environ.get("MCP_TRANSPORT", "http"),
