@@ -99,7 +99,8 @@ def main() -> None:
     logging.basicConfig(level=settings.log_level, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     mcp = build_server(settings)
     logger.info("Starting Mealie MCP on %s:%s (%s)", settings.host, settings.port, settings.transport)
-    mcp.run(transport=cast(Transport, settings.transport), host=settings.host, port=settings.port)
+    kwargs: dict = {} if settings.transport == "stdio" else {"host": settings.host, "port": settings.port}
+    mcp.run(transport=cast(Transport, settings.transport), **kwargs)
 
 
 if __name__ == "__main__":
