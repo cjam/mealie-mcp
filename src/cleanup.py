@@ -658,6 +658,95 @@ def register_cleanup_tools(mcp: Any, client: httpx.AsyncClient) -> None:
         return "\n".join(lines)
 
     @mcp.tool()
+    async def get_recipes_needing_cleanup() -> str:
+        """
+        Scan all recipes and report which ones need ingredient cleanup or step linking.
+
+        Two categories are returned:
+          needs_cleanup — the recipe has at least one ingredient where food has no
+              resolved ID (foodId is null). Run cleanup_recipe on these first.
+          needs_linking — all ingredients have a resolved food ID, but at least one
+              instruction step has empty ingredientReferences. Run link_recipe_steps
+              on these after cleanup is done.
+
+        Recipes with no ingredients are skipped — they don't need either operation.
+
+        Note: fetches full detail for every recipe, so this can be slow on large
+        collections.
+
+        Returns:
+            Plain-text report listing slug and name for each recipe in both
+            categories, with a summary line.
+        """
+        summaries = await _get_all(client, "/api/recipes")
+
+        needs_cleanup: list[dict] = []
+        needs_linking: list[dict] = []
+        skipped = 0
+
+        for summary in summaries:
+            slug = summary.get("slug") or summary.get("id", "")
+            name = summary.get("name", slug)
+            try:
+                recipe = await _get_recipe(client, slug)
+            except Exception:
+                skipped += 1
+                continue
+
+            ingredients: list[dict] = recipe.get("recipeIngredient") or []
+            if not ingredients:
+                continue
+
+            has_unresolved = any(
+                not (ing.get("food") or {}).get("id")
+                for ing in ingredients
+            )
+
+            if has_unresolved:
+                needs_cleanup.append({"slug": slug, "name": name})
+                continue
+
+            steps: list[dict] = recipe.get("recipeInstructions") or []
+            if not steps:
+                continue
+
+            has_unlinked = any(
+                not (step.get("ingredientReferences") or [])
+                for step in steps
+            )
+
+            if has_unlinked:
+                needs_linking.append({"slug": slug, "name": name})
+
+        lines = ["=== Recipes Needing Cleanup ===", ""]
+        lines.append(f"## Needs Ingredient Cleanup ({len(needs_cleanup)} recipes)")
+        lines.append("  Next step: cleanup_recipe(<slug>)")
+        if needs_cleanup:
+            for r in needs_cleanup:
+                lines.append(f"  {r['slug']}  —  {r['name']}")
+        else:
+            lines.append("  (none)")
+
+        lines += [""]
+        lines.append(f"## Needs Step Linking ({len(needs_linking)} recipes)")
+        lines.append("  Next step: link_recipe_steps(<slug>, ...)")
+        if needs_linking:
+            for r in needs_linking:
+                lines.append(f"  {r['slug']}  —  {r['name']}")
+        else:
+            lines.append("  (none)")
+
+        scanned = len(summaries) - skipped
+        summary_line = (
+            f"=== {scanned} recipes scanned · {len(needs_cleanup)} need cleanup · "
+            f"{len(needs_linking)} need linking"
+            + (f" · {skipped} skipped (fetch error)" if skipped else "")
+            + " ==="
+        )
+        lines += ["", summary_line]
+        return "\n".join(lines)
+
+    @mcp.tool()
     async def import_and_cleanup_recipe(url: str) -> str:
         """
         Import a recipe from a URL and immediately run cleanup_recipe on it.
