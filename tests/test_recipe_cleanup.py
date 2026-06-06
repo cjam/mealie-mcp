@@ -68,10 +68,10 @@ def _note_ingredient(note_text: str, ref_id: str | None = None) -> dict:
     }
 
 
-def _linked_ingredient(food: dict, unit: dict, quantity: float = 1.0) -> dict:
+def _linked_ingredient(food: dict, unit: dict, quantity: float = 1.0, ref_id: str | None = None) -> dict:
     """Build an ingredient already linked to DB food/unit objects (full objects with IDs)."""
     return {
-        "referenceId": str(uuid.uuid4()),
+        "referenceId": ref_id or str(uuid.uuid4()),
         "food": food,
         "unit": unit,
         "quantity": quantity,
@@ -380,7 +380,7 @@ async def test_get_recipes_needing_cleanup_surfaces_unresolved_ingredient(mealie
 
 
 async def test_get_recipes_needing_cleanup_surfaces_unlinked_steps(mealie_http, mcp_server):
-    """A recipe with all food IDs resolved but steps missing ingredientReferences appears under needs_linking."""
+    """A recipe with all food IDs resolved but zero total step references appears under needs_linking."""
     slug = await _create_recipe(mealie_http, "NeedsCleanup: Unlinked Steps")
     r = await mealie_http.post("/api/foods", json={"name": "xyzzy_linked_food_scan"})
     food = r.json()
@@ -397,7 +397,9 @@ async def test_get_recipes_needing_cleanup_surfaces_unlinked_steps(mealie_http, 
             result = await mcp.call_tool("get_recipes_needing_cleanup", {})
 
         report = result.content[0].text
-        needs_linking_section = report.split("## Needs Step Linking")[1]
+        needs_linking_section = (
+            report.split("## Needs Step Linking")[1].split("## Incomplete Step Linking")[0]
+        )
         assert slug in needs_linking_section, f"Slug should be in needs_linking section:\n{report}"
     finally:
         await _delete_recipe(mealie_http, slug)
@@ -405,18 +407,64 @@ async def test_get_recipes_needing_cleanup_surfaces_unlinked_steps(mealie_http, 
         await _purge_units(mealie_http, "xyzzy_linked_unit_scan")
 
 
+async def test_get_recipes_needing_cleanup_surfaces_incomplete_linking(mealie_http, mcp_server):
+    """A recipe where some but not all ingredients are referenced in steps appears under incomplete_linking."""
+    slug = await _create_recipe(mealie_http, "NeedsCleanup: Incomplete Linking")
+    r = await mealie_http.post("/api/foods", json={"name": "xyzzy_incomplete_food_a"})
+    food_a = r.json()
+    r = await mealie_http.post("/api/foods", json={"name": "xyzzy_incomplete_food_b"})
+    food_b = r.json()
+    r = await mealie_http.post("/api/units", json={"name": "xyzzy_incomplete_unit", "abbreviation": ""})
+    unit = r.json()
+    try:
+        ref_a = str(uuid.uuid4())
+        ref_b = str(uuid.uuid4())
+        # Step references only ingredient A — ingredient B intentionally left unlinked.
+        await _set_ingredients(
+            mealie_http, slug,
+            ingredients=[
+                _linked_ingredient(food_a, unit, ref_id=ref_a),
+                _linked_ingredient(food_b, unit, ref_id=ref_b),
+            ],
+            instructions=[{
+                "title": "",
+                "text": "Use food A only.",
+                "ingredientReferences": [{"referenceId": ref_a}],
+            }],
+        )
+
+        async with Client(mcp_server) as mcp:
+            result = await mcp.call_tool("get_recipes_needing_cleanup", {})
+
+        report = result.content[0].text
+        incomplete_section = report.split("## Incomplete Step Linking")[1]
+        assert slug in incomplete_section, f"Slug should be in incomplete_linking section:\n{report}"
+        # Must not be mis-classified as needs_linking (it has references, just not full coverage)
+        needs_linking_section = (
+            report.split("## Needs Step Linking")[1].split("## Incomplete Step Linking")[0]
+        )
+        assert slug not in needs_linking_section, (
+            f"Slug should not be in needs_linking (it has some references):\n{report}"
+        )
+    finally:
+        await _delete_recipe(mealie_http, slug)
+        await _purge_foods(mealie_http, "xyzzy_incomplete_food_a", "xyzzy_incomplete_food_b")
+        await _purge_units(mealie_http, "xyzzy_incomplete_unit")
+
+
 async def test_get_recipes_needing_cleanup_skips_empty_recipes(mealie_http, mcp_server):
-    """A recipe with no ingredients does not appear in either category."""
+    """A recipe with no ingredients does not appear in any category."""
     slug = await _create_recipe(mealie_http, "NeedsCleanup: Empty Recipe")
     try:
         async with Client(mcp_server) as mcp:
             result = await mcp.call_tool("get_recipes_needing_cleanup", {})
 
         report = result.content[0].text
-        # Check neither section lists this slug
         needs_cleanup_section = report.split("## Needs Ingredient Cleanup")[1].split("## Needs Step Linking")[0]
-        needs_linking_section = report.split("## Needs Step Linking")[1]
+        needs_linking_section = report.split("## Needs Step Linking")[1].split("## Incomplete Step Linking")[0]
+        incomplete_section = report.split("## Incomplete Step Linking")[1]
         assert slug not in needs_cleanup_section, f"Empty recipe should not be in needs_cleanup:\n{report}"
         assert slug not in needs_linking_section, f"Empty recipe should not be in needs_linking:\n{report}"
+        assert slug not in incomplete_section, f"Empty recipe should not be in incomplete_linking:\n{report}"
     finally:
         await _delete_recipe(mealie_http, slug)

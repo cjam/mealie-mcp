@@ -662,12 +662,15 @@ def register_cleanup_tools(mcp: Any, client: httpx.AsyncClient) -> None:
         """
         Scan all recipes and report which ones need ingredient cleanup or step linking.
 
-        Two categories are returned:
-          needs_cleanup — the recipe has at least one ingredient where food has no
-              resolved ID (foodId is null). Run cleanup_recipe on these first.
-          needs_linking — all ingredients have a resolved food ID, but at least one
-              instruction step has empty ingredientReferences. Run link_recipe_steps
-              on these after cleanup is done.
+        Three categories are returned, in priority order:
+          needs_cleanup — has at least one ingredient with no resolved food ID.
+              Run cleanup_recipe on these first.
+          needs_linking — all food IDs resolved, has steps, but zero ingredient
+              references exist across all steps (linking has never been done).
+              Run link_recipe_steps on these next.
+          incomplete_linking — some references exist, but not every ingredient
+              referenceId is covered by at least one step. Partial linking done;
+              revisit with link_recipe_steps to fill gaps.
 
         Recipes with no ingredients are skipped — they don't need either operation.
 
@@ -675,13 +678,14 @@ def register_cleanup_tools(mcp: Any, client: httpx.AsyncClient) -> None:
         collections.
 
         Returns:
-            Plain-text report listing slug and name for each recipe in both
+            Plain-text report listing slug and name for each recipe in all three
             categories, with a summary line.
         """
         summaries = await _get_all(client, "/api/recipes")
 
         needs_cleanup: list[dict] = []
         needs_linking: list[dict] = []
+        incomplete_linking: list[dict] = []
         skipped = 0
 
         for summary in summaries:
@@ -710,15 +714,32 @@ def register_cleanup_tools(mcp: Any, client: httpx.AsyncClient) -> None:
             if not steps:
                 continue
 
-            has_unlinked = any(
-                not (step.get("ingredientReferences") or [])
+            total_references = sum(
+                len(step.get("ingredientReferences") or [])
                 for step in steps
             )
 
-            if has_unlinked:
+            if total_references == 0:
                 needs_linking.append({"slug": slug, "name": name})
+                continue
+
+            ingredient_ref_ids = {
+                ing["referenceId"]
+                for ing in ingredients
+                if ing.get("referenceId")
+            }
+            step_ref_ids = {
+                ref["referenceId"]
+                for step in steps
+                for ref in (step.get("ingredientReferences") or [])
+                if ref.get("referenceId")
+            }
+
+            if not ingredient_ref_ids.issubset(step_ref_ids):
+                incomplete_linking.append({"slug": slug, "name": name})
 
         lines = ["=== Recipes Needing Cleanup ===", ""]
+
         lines.append(f"## Needs Ingredient Cleanup ({len(needs_cleanup)} recipes)")
         lines.append("  Next step: cleanup_recipe(<slug>)")
         if needs_cleanup:
@@ -736,10 +757,20 @@ def register_cleanup_tools(mcp: Any, client: httpx.AsyncClient) -> None:
         else:
             lines.append("  (none)")
 
+        lines += [""]
+        lines.append(f"## Incomplete Step Linking ({len(incomplete_linking)} recipes)")
+        lines.append("  Some ingredients not referenced in any step.")
+        lines.append("  Next step: link_recipe_steps(<slug>, ...) to fill gaps.")
+        if incomplete_linking:
+            for r in incomplete_linking:
+                lines.append(f"  {r['slug']}  —  {r['name']}")
+        else:
+            lines.append("  (none)")
+
         scanned = len(summaries) - skipped
         summary_line = (
             f"=== {scanned} recipes scanned · {len(needs_cleanup)} need cleanup · "
-            f"{len(needs_linking)} need linking"
+            f"{len(needs_linking)} need linking · {len(incomplete_linking)} incomplete"
             + (f" · {skipped} skipped (fetch error)" if skipped else "")
             + " ==="
         )
