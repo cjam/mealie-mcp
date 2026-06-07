@@ -315,6 +315,7 @@ async def _cleanup_recipe_impl(client: httpx.AsyncClient, recipe_slug: str) -> s
     except Exception as exc:
         return f"ERROR: could not fetch recipe '{recipe_slug}': {exc}"
 
+    recipe_slug = recipe.get("slug", recipe_slug)
     recipe_name = recipe.get("name", recipe_slug)
     lines: list[str] = [f"=== Recipe Cleanup: {recipe_name} ===", ""]
 
