@@ -668,3 +668,134 @@ async def test_fix_ingredient_returns_error_for_unknown_recipe(mcp_server):
         )
     report = result.content[0].text  # type: ignore[union-attr]
     assert "error" in report.lower(), f"Expected error for unknown recipe:\n{report}"
+
+
+# ── Tests: create_recipe ──────────────────────────────────────────────────────
+
+
+async def test_create_recipe_tool_is_registered(mcp_server):
+    async with Client(mcp_server) as client:
+        tools = await client.list_tools()
+    assert any(t.name == "create_recipe" for t in tools)
+
+
+async def test_create_recipe_creates_and_returns_slug(mealie_http, mcp_server):
+    """create_recipe persists a new recipe and returns its slug."""
+    recipe_name = "Test Create Recipe XYZ"
+    slug = None
+    try:
+        async with Client(mcp_server) as mcp:
+            result = await mcp.call_tool("create_recipe", {"name": recipe_name})
+        report = result.content[0].text
+        assert "ERROR" not in report, f"Unexpected error: {report}"
+        assert "Slug:" in report, f"Expected slug in output: {report}"
+
+        slug = report.split("Slug:")[-1].strip()
+        recipe = await _get_recipe(mealie_http, slug)
+        assert recipe["name"] == recipe_name
+    finally:
+        if slug:
+            await _delete_recipe(mealie_http, slug)
+
+
+async def test_create_recipe_sets_description_and_servings(mealie_http, mcp_server):
+    """create_recipe applies optional description and servings when provided."""
+    recipe_name = "Test Create With Meta XYZ"
+    slug = None
+    try:
+        async with Client(mcp_server) as mcp:
+            result = await mcp.call_tool(
+                "create_recipe",
+                {"name": recipe_name, "description": "A test recipe", "servings": 4},
+            )
+        slug = result.content[0].text.split("Slug:")[-1].strip()
+        recipe = await _get_recipe(mealie_http, slug)
+        assert recipe.get("description") == "A test recipe"
+        assert recipe.get("recipeYield") == "4"
+    finally:
+        if slug:
+            await _delete_recipe(mealie_http, slug)
+
+
+# ── Tests: update_recipe ──────────────────────────────────────────────────────
+
+
+async def test_update_recipe_tool_is_registered(mcp_server):
+    async with Client(mcp_server) as client:
+        tools = await client.list_tools()
+    assert any(t.name == "update_recipe" for t in tools)
+
+
+async def test_update_recipe_changes_description_and_servings(mealie_http, mcp_server):
+    """update_recipe writes new description and servings without touching other fields."""
+    slug = await _create_recipe(mealie_http, "UpdateRecipe: Original Name")
+    try:
+        async with Client(mcp_server) as mcp:
+            result = await mcp.call_tool(
+                "update_recipe",
+                {"recipe_slug": slug, "description": "Updated desc", "servings": 6},
+            )
+        report = result.content[0].text
+        assert "ERROR" not in report, f"Unexpected error: {report}"
+
+        recipe = await _get_recipe(mealie_http, slug)
+        assert recipe.get("description") == "Updated desc"
+        assert recipe.get("recipeYield") == "6"
+        assert recipe["name"] == "UpdateRecipe: Original Name"
+    finally:
+        await _delete_recipe(mealie_http, slug)
+
+
+async def test_update_recipe_no_fields_returns_message(mealie_http, mcp_server):
+    """update_recipe with no optional fields returns a helpful no-op message."""
+    slug = await _create_recipe(mealie_http, "UpdateRecipe: No Fields")
+    try:
+        async with Client(mcp_server) as mcp:
+            result = await mcp.call_tool("update_recipe", {"recipe_slug": slug})
+        report = result.content[0].text
+        assert "no fields" in report.lower(), f"Expected no-op message: {report}"
+    finally:
+        await _delete_recipe(mealie_http, slug)
+
+
+async def test_update_recipe_returns_error_for_unknown_slug(mcp_server):
+    async with Client(mcp_server) as mcp:
+        result = await mcp.call_tool("update_recipe", {"recipe_slug": "does-not-exist-xyz", "description": "x"})
+    assert "ERROR" in result.content[0].text
+
+
+# ── Tests: suggest_recipes_by_name ────────────────────────────────────────────
+
+
+async def test_suggest_recipes_by_name_tool_is_registered(mcp_server):
+    async with Client(mcp_server) as client:
+        tools = await client.list_tools()
+    assert any(t.name == "suggest_recipes_by_name" for t in tools)
+
+
+async def test_suggest_recipes_by_name_unknown_foods_returns_error(mcp_server):
+    """suggest_recipes_by_name returns an error when none of the foods exist in the DB."""
+    async with Client(mcp_server) as mcp:
+        result = await mcp.call_tool(
+            "suggest_recipes_by_name",
+            {"food_names": ["xyzzy_nonexistent_food_aaa", "xyzzy_nonexistent_food_bbb"]},
+        )
+    report = result.content[0].text
+    assert "ERROR" in report, f"Expected error for unknown foods: {report}"
+
+
+async def test_suggest_recipes_by_name_partial_match_skips_unknown(mealie_http, mcp_server):
+    """Unresolved food names are skipped; the call still proceeds with resolved ones."""
+    r = await mealie_http.post("/api/foods", json={"name": "xyzzy_suggest_food"})
+    food_id = r.json()["id"]
+    try:
+        async with Client(mcp_server) as mcp:
+            result = await mcp.call_tool(
+                "suggest_recipes_by_name",
+                {"food_names": ["xyzzy_suggest_food", "xyzzy_nonexistent_xyz"]},
+            )
+        report = result.content[0].text
+        assert "ERROR" not in report, f"Partial match should not error: {report}"
+        assert "xyzzy_nonexistent_xyz" in report, "Unresolved food should appear in note"
+    finally:
+        await mealie_http.delete(f"/api/foods/{food_id}")

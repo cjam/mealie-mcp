@@ -204,3 +204,85 @@ async def test_report_contains_all_sections(mcp_server):
     report = result.content[0].text
     for section in ("## Backup", "## Foods", "## Units", "=== Done ==="):
         assert section in report, f"Missing section '{section}' in report"
+
+
+# ── merge_foods / merge_units tests ──────────────────────────────────────────
+
+async def test_merge_foods_tool_is_registered(mcp_server):
+    async with Client(mcp_server) as client:
+        tools = await client.list_tools()
+    assert any(t.name == "merge_foods" for t in tools)
+
+
+async def test_merge_units_tool_is_registered(mcp_server):
+    async with Client(mcp_server) as client:
+        tools = await client.list_tools()
+    assert any(t.name == "merge_units" for t in tools)
+
+
+async def test_merge_foods_combines_two_foods(mealie_http, mcp_server):
+    """merge_foods absorbs the duplicate into the keep entry (one remains)."""
+    await _purge_foods(mealie_http, "Basil", "basil")
+    keep_id = await _create_food(mealie_http, "Basil")
+    dup_id = await _create_food(mealie_http, "basil")
+    try:
+        async with Client(mcp_server) as client:
+            result = await client.call_tool(
+                "merge_foods", {"keep_name": "Basil", "remove_name": "basil"}
+            )
+        report = result.content[0].text
+        assert "Merged" in report, f"Expected success message, got: {report}"
+
+        names = await _food_names(mealie_http)
+        basil_variants = [n for n in names if n.lower() == "basil"]
+        assert len(basil_variants) == 1, f"Expected exactly one basil after merge, got: {basil_variants}"
+    finally:
+        for fid in await _food_ids_by_name(mealie_http, "Basil"):
+            await _delete_food(mealie_http, fid)
+        for fid in await _food_ids_by_name(mealie_http, "basil"):
+            await _delete_food(mealie_http, fid)
+
+
+async def test_merge_foods_unknown_keep(mcp_server):
+    """merge_foods returns an error if keep_name is not in the database."""
+    async with Client(mcp_server) as client:
+        result = await client.call_tool(
+            "merge_foods",
+            {"keep_name": "nonexistent_food_xyz", "remove_name": "also_nonexistent"},
+        )
+    assert "ERROR" in result.content[0].text
+
+
+async def test_merge_units_combines_two_units(mealie_http, mcp_server):
+    """merge_units absorbs the duplicate into the keep entry (one remains)."""
+    await _purge_units(mealie_http, "tablespoon", "tbsp")
+    keep_id = await _create_unit(mealie_http, "tablespoon", "tbsp")
+    dup_id = await _create_unit(mealie_http, "tbsp", "tbsp")
+    try:
+        async with Client(mcp_server) as client:
+            result = await client.call_tool(
+                "merge_units", {"keep_name": "tablespoon", "remove_name": "tbsp"}
+            )
+        report = result.content[0].text
+        assert "Merged" in report, f"Expected success message, got: {report}"
+
+        names = await _unit_names(mealie_http)
+        tbsp_variants = [n for n in names if n.lower() in ("tablespoon", "tbsp")]
+        assert len(tbsp_variants) == 1, f"Expected exactly one entry after merge, got: {tbsp_variants}"
+    finally:
+        await _purge_units(mealie_http, "tablespoon", "tbsp")
+
+
+async def test_merge_units_unknown_remove(mealie_http, mcp_server):
+    """merge_units returns an error if remove_name is not in the database."""
+    await _purge_units(mealie_http, "cup")
+    uid = await _create_unit(mealie_http, "cup", "c")
+    try:
+        async with Client(mcp_server) as client:
+            result = await client.call_tool(
+                "merge_units",
+                {"keep_name": "cup", "remove_name": "nonexistent_unit_xyz"},
+            )
+        assert "ERROR" in result.content[0].text
+    finally:
+        await _purge_units(mealie_http, "cup")

@@ -17,6 +17,8 @@ from utils import (
     normalize_unit,
 )
 
+_SUGGEST_PATH = "/api/recipes/suggestions"
+
 
 def register_recipe_tools(mcp: Any, client: httpx.AsyncClient) -> None:
 
@@ -321,3 +323,172 @@ def register_recipe_tools(mcp: Any, client: httpx.AsyncClient) -> None:
             return f"ERROR: import succeeded but no slug returned for {url!r}"
 
         return await cleanup_recipe_impl(client, slug)
+
+    @mcp.tool()
+    async def create_recipe(
+        name: str,
+        description: str = "",
+        servings: int | None = None,
+    ) -> str:
+        """
+        Create a new recipe from scratch.
+
+        Creates a recipe with the given name, then optionally sets description
+        and servings count. Returns the slug for use with cleanup_recipe,
+        update_recipe, link_recipe_steps, and meal planning tools.
+
+        Args:
+            name:        Recipe name.
+            description: Optional description / notes.
+            servings:    Optional number of servings.
+
+        Returns:
+            Plain-text confirmation with the recipe slug.
+        """
+        try:
+            r = await client.post("/api/recipes", json={"name": name})
+            r.raise_for_status()
+            slug = r.json()
+        except Exception as exc:
+            return f"ERROR: failed to create recipe '{name}': {exc}"
+
+        if not isinstance(slug, str):
+            slug = (slug or {}).get("slug") or (slug or {}).get("id", "")
+
+        if description or servings is not None:
+            try:
+                recipe = await get_recipe(client, slug)
+                if description:
+                    recipe["description"] = description
+                if servings is not None:
+                    recipe["recipeYield"] = str(servings)
+                await put_recipe(client, slug, recipe)
+            except Exception:
+                pass
+
+        return f"Created recipe '{name}'\nSlug: {slug}"
+
+    @mcp.tool()
+    async def update_recipe(
+        recipe_slug: str,
+        name: str | None = None,
+        description: str | None = None,
+        servings: int | None = None,
+    ) -> str:
+        """
+        Update metadata fields on an existing recipe.
+
+        Only the fields you provide are changed — omit a field to leave it as-is.
+        Use this to fix a recipe's name or description after importing, or to set
+        servings on a newly created recipe.
+
+        If name is changed, Mealie regenerates the slug — the new slug is returned
+        so downstream calls (link_recipe_steps, meal planning) use the right value.
+
+        Args:
+            recipe_slug: The recipe slug or ID.
+            name:        New recipe name (optional).
+            description: New description (optional).
+            servings:    New number of servings (optional).
+
+        Returns:
+            Plain-text summary of changes and the (potentially new) slug.
+        """
+        try:
+            recipe = await get_recipe(client, recipe_slug)
+        except Exception as exc:
+            return f"ERROR: could not fetch recipe '{recipe_slug}': {exc}"
+
+        changes: list[str] = []
+        if name is not None:
+            recipe["name"] = name
+            changes.append(f"name → '{name}'")
+        if description is not None:
+            recipe["description"] = description
+            changes.append("description updated")
+        if servings is not None:
+            recipe["recipeYield"] = str(servings)
+            changes.append(f"servings → {servings}")
+
+        if not changes:
+            return "No fields to update — provide at least one of: name, description, servings"
+
+        ok = await put_recipe(client, recipe_slug, recipe)
+        if not ok:
+            return "ERROR: update failed — check Mealie logs"
+
+        # Re-fetch to get the authoritative slug (name change regenerates it).
+        new_slug = recipe_slug
+        try:
+            updated = await get_recipe(client, recipe_slug)
+            new_slug = updated.get("slug", recipe_slug)
+        except Exception:
+            pass
+
+        result = f"Updated '{recipe.get('name', recipe_slug)}': {', '.join(changes)}"
+        if new_slug != recipe_slug:
+            result += f"\nNew slug: {new_slug}"
+        return result
+
+    @mcp.tool()
+    async def suggest_recipes_by_name(food_names: list[str], limit: int = 10) -> str:
+        """
+        Suggest recipes based on food/ingredient names you have available.
+
+        Resolves each food name to its Mealie database ID, then queries the
+        recipe suggestions endpoint. Use this for "what can I cook with X, Y, Z"
+        queries. Food names are matched case-insensitively.
+
+        Args:
+            food_names: List of ingredient/food names to match against.
+            limit:      Maximum number of suggestions to return (default 10).
+
+        Returns:
+            Plain-text list of suggested recipes with name and slug, or an error
+            if none of the food names could be resolved.
+        """
+        foods = await get_all(client, "/api/foods")
+        food_map = {normalize_food(f["name"]): f for f in foods}
+
+        resolved_ids: list[str] = []
+        unresolved: list[str] = []
+        for name in food_names:
+            food = food_map.get(normalize_food(name))
+            if food:
+                resolved_ids.append(food["id"])
+            else:
+                unresolved.append(name)
+
+        if not resolved_ids:
+            return (
+                f"ERROR: none of the provided food names found in the database: {food_names}\n"
+                "Run cleanup_system first to populate the food database, or check "
+                "spelling against the foods list."
+            )
+
+        try:
+            params: list[tuple[str, str | int]] = [("foods", fid) for fid in resolved_ids]
+            params.append(("limit", limit))
+            r = await client.get(_SUGGEST_PATH, params=params)
+            r.raise_for_status()
+            data = r.json()
+            suggestions = data if isinstance(data, list) else data.get("items", [])
+        except Exception as exc:
+            return f"ERROR: suggestion query failed: {exc}"
+
+        lines = [f"=== Recipe Suggestions for: {', '.join(food_names)} ===", ""]
+        if unresolved:
+            lines.append(f"Note: foods not found in database (skipped): {', '.join(unresolved)}")
+            lines.append("")
+
+        if not suggestions:
+            lines.append("No suggestions found.")
+            return "\n".join(lines)
+
+        for recipe in suggestions:
+            rname = recipe.get("name", "?")
+            slug = recipe.get("slug") or recipe.get("id", "?")
+            lines.append(f"  {rname}  (slug: {slug})")
+
+        lines.append(f"\n{len(suggestions)} suggestion(s)")
+        return "\n".join(lines)

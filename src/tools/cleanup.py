@@ -248,3 +248,71 @@ def register_cleanup_tools(mcp: Any, client: httpx.AsyncClient) -> None:
 
         lines.append("=== Done ===")
         return "\n".join(lines)
+
+    @mcp.tool()
+    async def merge_foods(keep_name: str, remove_name: str) -> str:
+        """
+        Merge two food entries by name.
+
+        Redirects every recipe ingredient that references remove_name to keep_name,
+        then removes the duplicate entry. Use this to manually resolve specific
+        duplicates without running the full cleanup_system.
+
+        Args:
+            keep_name:   The food name to keep (the surviving entry).
+            remove_name: The food name to absorb into keep_name (will be deleted).
+
+        Returns:
+            Success or error message.
+        """
+        foods = await get_all(client, "/api/foods")
+        name_map = {normalize_food(f["name"]): f for f in foods}
+
+        keep = name_map.get(normalize_food(keep_name))
+        remove = name_map.get(normalize_food(remove_name))
+
+        if keep is None:
+            return f"ERROR: food '{keep_name}' not found in database"
+        if remove is None:
+            return f"ERROR: food '{remove_name}' not found in database"
+        if keep["id"] == remove["id"]:
+            return f"ERROR: '{keep_name}' and '{remove_name}' resolve to the same entry — nothing to merge"
+
+        ok = await _merge_foods(client, remove["id"], keep["id"])
+        if ok:
+            return f"Merged '{remove['name']}' → '{keep['name']}' (removed {remove['id'][:8]}…)"
+        return "ERROR: merge failed — check Mealie logs"
+
+    @mcp.tool()
+    async def merge_units(keep_name: str, remove_name: str) -> str:
+        """
+        Merge two unit entries by name.
+
+        Redirects every recipe ingredient that references remove_name to keep_name,
+        then removes the duplicate entry. Use this to manually resolve specific
+        duplicates without running the full cleanup_system.
+
+        Args:
+            keep_name:   The unit name to keep (the surviving entry).
+            remove_name: The unit name to absorb into keep_name (will be deleted).
+
+        Returns:
+            Success or error message.
+        """
+        units = await get_all(client, "/api/units")
+        name_map = {normalize_unit(u["name"]): u for u in units}
+
+        keep = name_map.get(normalize_unit(keep_name))
+        remove = name_map.get(normalize_unit(remove_name))
+
+        if keep is None:
+            return f"ERROR: unit '{keep_name}' not found in database"
+        if remove is None:
+            return f"ERROR: unit '{remove_name}' not found in database"
+        if keep["id"] == remove["id"]:
+            return f"ERROR: '{keep_name}' and '{remove_name}' resolve to the same entry — nothing to merge"
+
+        ok = await _merge_units(client, remove["id"], keep["id"])
+        if ok:
+            return f"Merged '{remove['name']}' → '{keep['name']}' (removed {remove['id'][:8]}…)"
+        return "ERROR: merge failed — check Mealie logs"
