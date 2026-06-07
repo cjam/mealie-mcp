@@ -346,6 +346,41 @@ async def test_cleanup_recipe_returns_error_for_unknown_slug(mcp_server):
     assert "error" in report.lower(), f"Expected error message, got:\n{report}"
 
 
+async def _list_all_slugs(client: httpx.AsyncClient) -> set[str]:
+    r = await client.get("/api/recipes", params={"perPage": 500})
+    r.raise_for_status()
+    return {item["slug"] for item in r.json().get("items", [])}
+
+
+async def test_import_and_cleanup_recipe_end_to_end(mealie_http, mcp_server):
+    """import_and_cleanup_recipe imports a real recipe URL, resolves ingredients, and reports step-linking data."""
+    url = "https://cookieandkate.com/chocolate-chia-pudding/"
+
+    before = await _list_all_slugs(mealie_http)
+
+    async with Client(mcp_server) as mcp:
+        result = await mcp.call_tool("import_and_cleanup_recipe", {"url": url})
+
+    report = result.content[0].text
+    assert not report.startswith("ERROR"), f"Import failed:\n{report}"
+    assert "Recipe Cleanup" in report, f"Missing cleanup section:\n{report}"
+    assert "Ready for Step Linking" in report, f"Missing step-linking section:\n{report}"
+
+    after = await _list_all_slugs(mealie_http)
+    new_slugs = after - before
+    assert len(new_slugs) == 1, f"Expected exactly 1 new recipe, got: {new_slugs}"
+    slug = next(iter(new_slugs))
+
+    try:
+        recipe = await _get_recipe(mealie_http, slug)
+        ingredients = recipe.get("recipeIngredient") or []
+        assert len(ingredients) > 0, "Imported recipe has no ingredients"
+        resolved = [i for i in ingredients if (i.get("food") or {}).get("id")]
+        assert len(resolved) > 0, f"No ingredients resolved after cleanup: {ingredients}"
+    finally:
+        await _delete_recipe(mealie_http, slug)
+
+
 async def test_import_and_cleanup_returns_error_for_invalid_url(mcp_server):
     """import_and_cleanup_recipe returns a readable error for an unreachable URL."""
     async with Client(mcp_server) as mcp:
