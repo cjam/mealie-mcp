@@ -778,6 +778,79 @@ def register_cleanup_tools(mcp: Any, client: httpx.AsyncClient) -> None:
         return "\n".join(lines)
 
     @mcp.tool()
+    async def fix_ingredient(
+        recipe_slug: str,
+        reference_id: str,
+        food_name: str,
+        unit_name: str = "",
+        quantity: float | None = None,
+        note: str = "",
+    ) -> str:
+        """
+        Surgically fix a single ingredient on a recipe without touching the rest.
+
+        Use this when cleanup_recipe or manual inspection reveals a broken or
+        misidentified ingredient. It finds the ingredient by referenceId, resolves
+        (or creates) the food and optional unit in the Mealie database, applies
+        any quantity/note override, then PUTs the recipe back.
+
+        Args:
+            recipe_slug:  The recipe slug or ID.
+            reference_id: The ingredient's referenceId (shown in cleanup_recipe output).
+            food_name:    Corrected food name. Looked up or created in the food DB.
+            unit_name:    Corrected unit name (optional). Looked up or created.
+            quantity:     Corrected quantity (optional). Leave None to keep existing.
+            note:         Corrected note/display text (optional). Leave empty to keep existing.
+
+        Returns:
+            Plain-text summary of what changed and whether the PATCH succeeded.
+        """
+        try:
+            recipe = await _get_recipe(client, recipe_slug)
+        except Exception as exc:
+            return f"ERROR: could not fetch recipe '{recipe_slug}': {exc}"
+
+        ingredients: list[dict] = recipe.get("recipeIngredient") or []
+        target = next((i for i in ingredients if i.get("referenceId") == reference_id), None)
+        if target is None:
+            return f"ERROR: no ingredient with referenceId '{reference_id}' in recipe '{recipe_slug}'"
+
+        foods = await _get_all(client, "/api/foods")
+        units = await _get_all(client, "/api/units")
+        food_map = {_normalize_food(f["name"]): f for f in foods}
+        unit_map = {_normalize_unit(u["name"]): u for u in units}
+
+        lines: list[str] = [f"=== Fix Ingredient [{reference_id}] in '{recipe.get('name', recipe_slug)}' ===", ""]
+
+        food, action = await _find_or_create_food(client, food_name, food_map)
+        if food is None:
+            return f"ERROR: could not find or create food '{food_name}'"
+        target["food"] = food
+        lines.append(f"  food: '{food['name']}' [{action}]")
+
+        if unit_name:
+            unit, u_action = await _find_or_create_unit(client, unit_name, unit_map)
+            if unit is None:
+                lines.append(f"  WARN: could not find or create unit '{unit_name}' — unit left unchanged")
+            else:
+                target["unit"] = unit
+                lines.append(f"  unit: '{unit['name']}' [{u_action}]")
+
+        if quantity is not None:
+            target["quantity"] = quantity
+            lines.append(f"  quantity: {quantity}")
+
+        if note:
+            target["note"] = note
+            lines.append(f"  note: '{note}'")
+
+        lines.append("")
+        ok = await _put_recipe(client, recipe_slug, recipe)
+        lines.append("PATCH OK" if ok else "WARN: patch failed — check Mealie logs")
+        lines.append("\n=== Done ===")
+        return "\n".join(lines)
+
+    @mcp.tool()
     async def import_and_cleanup_recipe(url: str) -> str:
         """
         Import a recipe from a URL and immediately run cleanup_recipe on it.

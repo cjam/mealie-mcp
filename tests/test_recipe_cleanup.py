@@ -468,3 +468,163 @@ async def test_get_recipes_needing_cleanup_skips_empty_recipes(mealie_http, mcp_
         assert slug not in incomplete_section, f"Empty recipe should not be in incomplete_linking:\n{report}"
     finally:
         await _delete_recipe(mealie_http, slug)
+
+
+# ── Tests: fix_ingredient ─────────────────────────────────────────────────────
+
+
+async def test_fix_ingredient_tool_is_registered(mcp_server):
+    """fix_ingredient appears in the MCP tool list."""
+    async with Client(mcp_server) as client:
+        tools = await client.list_tools()
+    assert any(t.name == "fix_ingredient" for t in tools)
+
+
+async def test_fix_ingredient_replaces_food_and_patches_recipe(mealie_http, mcp_server):
+    """fix_ingredient links a corrected food to a specific ingredient by referenceId."""
+    food_name = "xyzzy_fix_food"
+    await _purge_foods(mealie_http, food_name, food_name.title())
+
+    # Start with a bad ingredient (raw note, no food linked)
+    ref_id = str(uuid.uuid4())
+    slug = await _create_recipe(mealie_http, "FixIngredient: Replace Food")
+    try:
+        await _set_ingredients(mealie_http, slug, [_note_ingredient("bad ingredient text", ref_id=ref_id)])
+
+        async with Client(mcp_server) as mcp:
+            result = await mcp.call_tool(
+                "fix_ingredient",
+                {"recipe_slug": slug, "reference_id": ref_id, "food_name": food_name},
+            )
+
+        report = result.content[0].text
+        assert "error" not in report.lower(), f"Unexpected error:\n{report}"
+        assert "patch ok" in report.lower(), f"Expected PATCH OK:\n{report}"
+
+        recipe = await _get_recipe(mealie_http, slug)
+        ing = next(i for i in recipe["recipeIngredient"] if i.get("referenceId") == ref_id)
+        assert (ing.get("food") or {}).get("id"), f"Food ID still null after fix: {ing}"
+        assert (ing.get("food") or {})["name"].lower() == food_name.lower()
+    finally:
+        await _delete_recipe(mealie_http, slug)
+        await _purge_foods(mealie_http, food_name, food_name.title())
+
+
+async def test_fix_ingredient_creates_missing_food(mealie_http, mcp_server):
+    """fix_ingredient creates the food in the DB when it doesn't exist yet."""
+    food_name = "xyzzy_fix_new_food"
+    await _purge_foods(mealie_http, food_name, food_name.title())
+
+    ref_id = str(uuid.uuid4())
+    slug = await _create_recipe(mealie_http, "FixIngredient: Create Food")
+    try:
+        await _set_ingredients(mealie_http, slug, [_note_ingredient("whatever", ref_id=ref_id)])
+
+        async with Client(mcp_server) as mcp:
+            result = await mcp.call_tool(
+                "fix_ingredient",
+                {"recipe_slug": slug, "reference_id": ref_id, "food_name": food_name},
+            )
+
+        report = result.content[0].text
+        assert "created" in report.lower(), f"Expected 'created' in:\n{report}"
+
+        ids = await _food_ids_by_name(mealie_http, food_name)
+        assert len(ids) == 1, f"Expected exactly 1 food, got {len(ids)}"
+    finally:
+        await _delete_recipe(mealie_http, slug)
+        await _purge_foods(mealie_http, food_name, food_name.title())
+
+
+async def test_fix_ingredient_sets_unit_and_quantity(mealie_http, mcp_server):
+    """fix_ingredient applies optional unit and quantity overrides."""
+    food_name = "xyzzy_fix_food_with_unit"
+    await _purge_foods(mealie_http, food_name, food_name.title())
+    await _purge_units(mealie_http, "tablespoon")
+
+    ref_id = str(uuid.uuid4())
+    slug = await _create_recipe(mealie_http, "FixIngredient: Unit + Quantity")
+    try:
+        await _set_ingredients(mealie_http, slug, [_note_ingredient("raw text", ref_id=ref_id)])
+
+        async with Client(mcp_server) as mcp:
+            result = await mcp.call_tool(
+                "fix_ingredient",
+                {
+                    "recipe_slug": slug,
+                    "reference_id": ref_id,
+                    "food_name": food_name,
+                    "unit_name": "tablespoon",
+                    "quantity": 2.0,
+                },
+            )
+
+        report = result.content[0].text
+        assert "patch ok" in report.lower(), f"Expected PATCH OK:\n{report}"
+
+        recipe = await _get_recipe(mealie_http, slug)
+        ing = next(i for i in recipe["recipeIngredient"] if i.get("referenceId") == ref_id)
+        assert (ing.get("unit") or {}).get("id"), f"Unit ID still null: {ing}"
+        assert ing.get("quantity") == 2.0, f"Quantity not updated: {ing}"
+    finally:
+        await _delete_recipe(mealie_http, slug)
+        await _purge_foods(mealie_http, food_name, food_name.title())
+        await _purge_units(mealie_http, "tablespoon")
+
+
+async def test_fix_ingredient_reuses_existing_food(mealie_http, mcp_server):
+    """fix_ingredient links to an existing food without creating a duplicate."""
+    food_name = "xyzzy_fix_existing_food"
+    await _purge_foods(mealie_http, food_name, food_name.title())
+    r = await mealie_http.post("/api/foods", json={"name": food_name})
+    existing_id = r.json()["id"]
+
+    ref_id = str(uuid.uuid4())
+    slug = await _create_recipe(mealie_http, "FixIngredient: Reuse Food")
+    try:
+        await _set_ingredients(mealie_http, slug, [_note_ingredient("old name", ref_id=ref_id)])
+
+        async with Client(mcp_server) as mcp:
+            result = await mcp.call_tool(
+                "fix_ingredient",
+                {"recipe_slug": slug, "reference_id": ref_id, "food_name": food_name},
+            )
+
+        report = result.content[0].text
+        assert "found" in report.lower(), f"Expected 'found' in:\n{report}"
+
+        ids = await _food_ids_by_name(mealie_http, food_name)
+        assert len(ids) == 1, f"Duplicate food created: {ids}"
+        assert ids[0] == existing_id
+    finally:
+        await _delete_recipe(mealie_http, slug)
+        await _purge_foods(mealie_http, food_name, food_name.title())
+
+
+async def test_fix_ingredient_returns_error_for_bad_reference_id(mealie_http, mcp_server):
+    """fix_ingredient returns a readable error when referenceId doesn't exist."""
+    slug = await _create_recipe(mealie_http, "FixIngredient: Bad RefId")
+    try:
+        await _set_ingredients(mealie_http, slug, [_note_ingredient("some ingredient")])
+
+        async with Client(mcp_server) as mcp:
+            result = await mcp.call_tool(
+                "fix_ingredient",
+                {"recipe_slug": slug, "reference_id": str(uuid.uuid4()), "food_name": "anything"},
+            )
+
+        report = result.content[0].text
+        assert "error" in report.lower(), f"Expected error for bad referenceId:\n{report}"
+    finally:
+        await _delete_recipe(mealie_http, slug)
+
+
+async def test_fix_ingredient_returns_error_for_unknown_recipe(mcp_server):
+    """fix_ingredient returns a readable error for a non-existent recipe slug."""
+    async with Client(mcp_server) as mcp:
+        result = await mcp.call_tool(
+            "fix_ingredient",
+            {"recipe_slug": "does-not-exist-xyz", "reference_id": str(uuid.uuid4()), "food_name": "anything"},
+        )
+    report = result.content[0].text  # type: ignore[union-attr]
+    assert "error" in report.lower(), f"Expected error for unknown recipe:\n{report}"
