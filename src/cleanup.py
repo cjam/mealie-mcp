@@ -193,6 +193,46 @@ async def _create_unit(client: httpx.AsyncClient, unit: dict) -> bool:
         return False
 
 
+# ── Ingredient misparse detection ────────────────────────────────────────────
+
+_MISPARSE_PHRASES: tuple[str, ...] = (
+    "at room temperature",
+    "store-bought",
+    "store bought",
+    "or homemade",
+    ", divided",
+    "divided",
+    "optional",
+    "to taste",
+    "as needed",
+)
+
+
+def _misparse_reason(ing: dict) -> str | None:
+    """Return a human-readable reason if the ingredient looks like a parse failure, else None."""
+    food_obj = ing.get("food")
+    unit_obj = ing.get("unit")
+    food_name = (food_obj or {}).get("name") if isinstance(food_obj, dict) else None
+
+    if food_obj is None:
+        if unit_obj:
+            return "food is null (unit present — likely a parsing failure)"
+        return "food is null"
+
+    if food_name:
+        lower = food_name.lower()
+        for phrase in _MISPARSE_PHRASES:
+            if phrase in lower:
+                return f"food name contains modifier ({phrase!r})"
+        # Single capitalized word ending in -ed/-en looks like a state adjective
+        if " " not in food_name and food_name[:1].isupper():
+            w = food_name.lower()
+            if w.endswith("ed") or w.endswith("en"):
+                return "food name looks like an adjective/state — probably truncated"
+
+    return None
+
+
 # ── Recipe cleanup helpers ────────────────────────────────────────────────────
 
 
@@ -377,19 +417,35 @@ async def _cleanup_recipe_impl(client: httpx.AsyncClient, recipe_slug: str) -> s
         "",
         "Ingredients:",
     ]
+    flagged: list[tuple[str, str, str]] = []  # (referenceId, display_name, reason)
     for ing in ingredients:
         ref   = ing.get("referenceId", "?")
         qty   = ing.get("quantity") or ""
         uname = (ing.get("unit") or {}).get("name") or ""
         fname = (ing.get("food") or {}).get("name") or (ing.get("note") or "").strip() or "?"
         qty_str = f"{qty} {uname}".strip()
-        lines.append(f"  [{ref}]  {qty_str} {fname}".rstrip())
+        reason = _misparse_reason(ing)
+        if reason:
+            flagged.append((ref, fname, reason))
+            lines.append(f"  [{ref}]  {qty_str} {fname}  ⚠️ {reason}".rstrip())
+        else:
+            lines.append(f"  [{ref}]  {qty_str} {fname}".rstrip())
 
     lines += ["", "Steps:"]
     for step in recipe.get("recipeInstructions") or []:
         sid  = step.get("id", "?")
         text = (step.get("text") or "").replace("\n", " ")[:150]
         lines.append(f"  [{sid}]  {text}")
+
+    lines += ["", "## Next Steps"]
+    if flagged:
+        lines.append("1. Fix flagged ingredients (call fix_ingredient for each ⚠️ above):")
+        for ref, fname, reason in flagged:
+            lines.append(f"   fix_ingredient('{recipe_slug}', '{ref}', food_name='<corrected name>')  # {fname} — {reason}")
+        lines.append("2. Then link steps:")
+        lines.append(f"   link_recipe_steps('{recipe_slug}', {{step_id: [ref_ids], ...}})")
+    else:
+        lines.append(f"All ingredients look clean. Next: link_recipe_steps('{recipe_slug}', {{step_id: [ref_ids], ...}})")
 
     lines += ["", "=== Done ==="]
     return "\n".join(lines)
@@ -703,6 +759,10 @@ def register_cleanup_tools(mcp: Any, client: httpx.AsyncClient) -> None:
 
             has_unresolved = any(
                 not (ing.get("food") or {}).get("id")
+                and (
+                    (ing.get("note") or "").strip()
+                    or (ing.get("food") or {}).get("name")
+                )
                 for ing in ingredients
             )
 
@@ -741,29 +801,26 @@ def register_cleanup_tools(mcp: Any, client: httpx.AsyncClient) -> None:
         lines = ["=== Recipes Needing Cleanup ===", ""]
 
         lines.append(f"## Needs Ingredient Cleanup ({len(needs_cleanup)} recipes)")
-        lines.append("  Next step: cleanup_recipe(<slug>)")
         if needs_cleanup:
             for r in needs_cleanup:
-                lines.append(f"  {r['slug']}  —  {r['name']}")
+                lines.append(f"  {r['name']}  →  cleanup_recipe('{r['slug']}')")
         else:
             lines.append("  (none)")
 
         lines += [""]
         lines.append(f"## Needs Step Linking ({len(needs_linking)} recipes)")
-        lines.append("  Next step: link_recipe_steps(<slug>, ...)")
         if needs_linking:
             for r in needs_linking:
-                lines.append(f"  {r['slug']}  —  {r['name']}")
+                lines.append(f"  {r['name']}  →  link_recipe_steps('{r['slug']}', {{step_id: [ref_ids], ...}})")
         else:
             lines.append("  (none)")
 
         lines += [""]
         lines.append(f"## Incomplete Step Linking ({len(incomplete_linking)} recipes)")
         lines.append("  Some ingredients not referenced in any step.")
-        lines.append("  Next step: link_recipe_steps(<slug>, ...) to fill gaps.")
         if incomplete_linking:
             for r in incomplete_linking:
-                lines.append(f"  {r['slug']}  —  {r['name']}")
+                lines.append(f"  {r['name']}  →  link_recipe_steps('{r['slug']}', {{step_id: [ref_ids], ...}})")
         else:
             lines.append("  (none)")
 

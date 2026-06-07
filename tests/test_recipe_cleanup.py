@@ -265,12 +265,13 @@ async def test_cleanup_recipe_output_contains_step_linking_section(mealie_http, 
                 "ingredientReferences": [],
             }],
         )
-        # Mealie assigns its own step IDs — read the actual one back
-        saved_recipe = await _get_recipe(mealie_http, slug)
-        actual_step_id = saved_recipe["recipeInstructions"][0]["id"]
-
         async with Client(mcp_server) as mcp:
             result = await mcp.call_tool("cleanup_recipe", {"recipe_slug": slug})
+
+        # Re-read after cleanup: Mealie regenerates step IDs on PUT, so the
+        # pre-cleanup ID is stale.
+        saved_recipe = await _get_recipe(mealie_http, slug)
+        actual_step_id = saved_recipe["recipeInstructions"][0]["id"]
 
         report = result.content[0].text
         assert "Ready for Step Linking" in report, f"Missing step-linking section:\n{report}"
@@ -491,6 +492,10 @@ async def test_get_recipes_needing_cleanup_skips_empty_recipes(mealie_http, mcp_
     """A recipe with no ingredients does not appear in any category."""
     slug = await _create_recipe(mealie_http, "NeedsCleanup: Empty Recipe")
     try:
+        # Mealie injects a placeholder ingredient on creation; clear it so the
+        # recipe is genuinely ingredient-free for this test.
+        await _set_ingredients(mealie_http, slug, [])
+
         async with Client(mcp_server) as mcp:
             result = await mcp.call_tool("get_recipes_needing_cleanup", {})
 
