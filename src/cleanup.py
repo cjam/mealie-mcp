@@ -856,7 +856,7 @@ def register_cleanup_tools(mcp: Any, client: httpx.AsyncClient) -> None:
         Import a recipe from a URL and immediately run cleanup_recipe on it.
 
         Combines Mealie's URL scraper with ingredient/unit resolution in one call:
-          1. POST to /api/recipes/create-from-url to scrape and import the recipe.
+          1. POST to /api/recipes/create-url to scrape and import the recipe.
           2. Run cleanup_recipe on the result to resolve foods and units, and
              return data for ingredient-to-step linking.
 
@@ -868,7 +868,7 @@ def register_cleanup_tools(mcp: Any, client: httpx.AsyncClient) -> None:
             message if the import fails.
         """
         try:
-            resp = await client.post("/api/recipes/create-from-url", json={"url": url})
+            resp = await client.post("/api/recipes/create-url", json={"url": url})
             resp.raise_for_status()
             data = resp.json()
             slug = data if isinstance(data, str) else data.get("slug") or data.get("id", "")
