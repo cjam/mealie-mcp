@@ -17,9 +17,9 @@ from fastmcp.server.middleware import Middleware, MiddlewareContext
 from fastmcp.server.server import Transport
 from typing import cast
 
-from cleanup import register_cleanup_tools
 from config import Settings, load_settings
 from routes import build_route_maps
+from tools import register_all_tools
 
 logger = logging.getLogger("mealie-mcp")
 
@@ -90,7 +90,7 @@ def build_server(settings: Settings) -> FastMCP:
         name="Mealie",
         route_maps=build_route_maps(),
     )
-    register_cleanup_tools(mcp, client)
+    register_all_tools(mcp, client)
     return mcp
 
 
