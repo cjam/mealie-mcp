@@ -10,8 +10,10 @@ from utils import (
     STANDARD_UNITS,
     canonical_food,
     get_all,
+    get_recipe,
     normalize_food,
     normalize_unit,
+    put_recipe,
 )
 
 
@@ -316,3 +318,230 @@ def register_cleanup_tools(mcp: Any, client: httpx.AsyncClient) -> None:
         if ok:
             return f"Merged '{remove['name']}' → '{keep['name']}' (removed {remove['id'][:8]}…)"
         return "ERROR: merge failed — check Mealie logs"
+
+    @mcp.tool()
+    async def get_ingredient_normalization_report() -> str:
+        """
+        Scan all recipes and report foods that appear with more than one distinct
+        unit, sorted by total recipe-use count descending.
+
+        Use this to diagnose shopping list duplication caused by the same food
+        being measured in different units across recipes (e.g. garlic in cloves
+        in one recipe and teaspoons in another). Only foods with 2+ distinct
+        units are included; single-unit foods are omitted.
+
+        Each ingredient entry includes its referenceId so you can pass the results
+        directly to normalize_ingredients without any additional lookups.
+
+        Returns:
+            Plain-text report listing each inconsistent food with food_id, each
+            unit variant with unit_id, and per-ingredient recipe_slug + reference_id
+            + quantity — followed by instructions for calling normalize_ingredients.
+        """
+        summaries = await get_all(client, "/api/recipes")
+
+        # food_id → unit_id_or_None → [(recipe_slug, recipe_name, ref_id, quantity, note)]
+        food_unit_map: dict[str, dict] = {}
+        food_names: dict[str, str] = {}
+        unit_names: dict[str, str] = {}
+
+        skipped = 0
+        for summary in summaries:
+            slug = summary.get("slug") or summary.get("id", "")
+            try:
+                recipe = await get_recipe(client, slug)
+            except Exception:
+                skipped += 1
+                continue
+
+            recipe_slug = recipe.get("slug", slug)
+            recipe_name = recipe.get("name", slug)
+
+            for ing in recipe.get("recipeIngredient") or []:
+                food_obj = ing.get("food") or {}
+                food_id = food_obj.get("id")
+                if not food_id:
+                    continue
+
+                food_names[food_id] = food_obj.get("name", food_id)
+
+                unit_obj = ing.get("unit") or {}
+                unit_id: str | None = unit_obj.get("id") or None
+                if unit_id:
+                    unit_names[unit_id] = unit_obj.get("name", unit_id)
+
+                food_unit_map.setdefault(food_id, {})
+                food_unit_map[food_id].setdefault(unit_id, []).append((
+                    recipe_slug,
+                    recipe_name,
+                    ing.get("referenceId") or "",
+                    ing.get("quantity"),
+                    (ing.get("note") or "").strip(),
+                ))
+
+        multi_unit = {
+            fid: units
+            for fid, units in food_unit_map.items()
+            if len(units) >= 2
+        }
+
+        if not multi_unit:
+            return (
+                "=== Ingredient Inconsistency Report ===\n\n"
+                "No foods with multiple unit variants found.\n"
+                "=== Done ==="
+            )
+
+        sorted_foods = sorted(
+            multi_unit.items(),
+            key=lambda kv: sum(len(v) for v in kv[1].values()),
+            reverse=True,
+        )
+
+        lines = ["=== Ingredient Inconsistency Report ===", ""]
+        lines.append(f"Foods with 2+ distinct units: {len(sorted_foods)}")
+        if skipped:
+            lines.append(f"Note: {skipped} recipe(s) skipped (fetch error)")
+        lines.append("")
+
+        for food_id, units in sorted_foods:
+            food_name = food_names.get(food_id, food_id)
+            total = sum(len(v) for v in units.values())
+            lines.append(f"## {food_name}  (food_id: {food_id})")
+            lines.append(f"   {len(units)} unit variant(s) across {total} use(s)")
+
+            for unit_id, uses in units.items():
+                uname = unit_names.get(unit_id, unit_id) if unit_id else "(no unit)"
+                uid_str = unit_id if unit_id else "null"
+                lines.append(f"   Unit: {uname}  (unit_id: {uid_str})")
+                for recipe_slug, recipe_name, ref_id, qty, note in uses:
+                    qty_str = str(qty) if qty is not None else "?"
+                    example = f"{qty_str} {uname}".strip()
+                    if note:
+                        example += f", {note}"
+                    lines.append(
+                        f"     {recipe_name}  (slug: {recipe_slug})"
+                        f"  ref: {ref_id}  — {example}"
+                    )
+            lines.append("")
+
+        lines += [
+            "## Instructions",
+            "For each food above, pick a target unit and call normalize_ingredients().",
+            "Use the ref and slug values from each ingredient line to build the conversions list.",
+            "",
+            "Steps:",
+            "  1. Choose a target_unit_id for the food (usually the most common unit above).",
+            "  2. For each ingredient NOT already on the target unit, calculate a conversion",
+            "     factor so that: new_quantity = old_quantity × factor.",
+            "     Example: 1 tsp minced garlic ≈ 0.5 cloves → factor = 0.5",
+            "  3. Include every ingredient you want to change in the conversions list.",
+            "     Ingredients already on the target unit can use factor=1.0 or be omitted.",
+            "",
+            "Call structure:",
+            "  normalize_ingredients(",
+            '    food_id        = "<food_id from ## header>",',
+            '    target_unit_id = "<chosen unit_id>",',
+            "    conversions    = [",
+            '      {"recipe_slug": "<slug>", "reference_id": "<ref>", "factor": <float>},',
+            "      ...",
+            "    ]",
+            "  )",
+            "=== Done ===",
+        ]
+        return "\n".join(lines)
+
+    @mcp.tool()
+    async def normalize_ingredients(
+        food_id: str,
+        target_unit_id: str | None,
+        conversions: list[dict],
+    ) -> str:
+        """
+        Normalize the unit on specific recipe ingredients and optionally rescale
+        their quantities in one shot.
+
+        This is the write step after get_ingredient_normalization_report. Each entry in
+        conversions identifies one ingredient by recipe_slug + reference_id, sets its
+        unit to target_unit_id, and multiplies its current quantity by factor.
+
+        Ingredients not listed in conversions are not touched.
+
+        Args:
+            food_id:        The food's database ID (from get_ingredient_normalization_report).
+                            Used only for reporting; the actual ingredient lookup is by
+                            reference_id.
+            target_unit_id: The unit ID to set on every listed ingredient. Pass null to
+                            clear the unit (whole/uncounted items).
+            conversions:    List of dicts, each containing:
+                              recipe_slug  — recipe slug (from the report)
+                              reference_id — ingredient referenceId (from the report)
+                              factor       — multiply current quantity by this;
+                                            use 1.0 when only the unit name changes
+
+        Returns:
+            Plain-text summary of each ingredient updated and the total count.
+        """
+        target_unit: dict | None = None
+        if target_unit_id:
+            try:
+                r = await client.get(f"/api/units/{target_unit_id}")
+                if r.is_success:
+                    target_unit = r.json()
+            except Exception:
+                pass
+            if target_unit is None:
+                all_units = await get_all(client, "/api/units")
+                target_unit = next((u for u in all_units if u.get("id") == target_unit_id), None)
+            if target_unit is None:
+                return f"ERROR: unit '{target_unit_id}' not found in database"
+
+        target_name = target_unit["name"] if target_unit else "(no unit)"
+
+        # Group conversions by recipe slug so we make one PUT per recipe.
+        by_recipe: dict[str, list[dict]] = {}
+        for conv in conversions:
+            by_recipe.setdefault(conv.get("recipe_slug", ""), []).append(conv)
+
+        lines = ["=== Normalize Ingredients ===", "", f"Target unit: {target_name}", ""]
+        total_updated = 0
+
+        for slug, recipe_convs in by_recipe.items():
+            try:
+                recipe = await get_recipe(client, slug)
+            except Exception as exc:
+                lines.append(f"  ERROR: could not fetch '{slug}': {exc}")
+                continue
+
+            recipe_name = recipe.get("name", slug)
+            recipe_slug = recipe.get("slug", slug)
+            ref_map = {conv["reference_id"]: conv for conv in recipe_convs}
+
+            updated = 0
+            for ing in recipe.get("recipeIngredient") or []:
+                ref_id = ing.get("referenceId")
+                if ref_id not in ref_map:
+                    continue
+
+                factor = float(ref_map[ref_id].get("factor", 1.0))
+                old_qty = ing.get("quantity")
+
+                ing["unit"] = target_unit
+                if old_qty is not None and factor != 1.0:
+                    ing["quantity"] = round(old_qty * factor, 6)
+
+                updated += 1
+
+            if updated:
+                ok = await put_recipe(client, recipe_slug, recipe)
+                status = "OK" if ok else "WARN: PUT failed"
+                lines.append(f"  {recipe_name}: {updated} ingredient(s) → {target_name}  [{status}]")
+                total_updated += updated
+            else:
+                lines.append(f"  {recipe_name}: no matching referenceIds found")
+
+        lines += [
+            "",
+            f"=== Total: {total_updated} ingredient(s) normalized across {len(by_recipe)} recipe(s) ===",
+        ]
+        return "\n".join(lines)
