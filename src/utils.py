@@ -5,6 +5,7 @@ Used by multiple tool modules. Nothing in here registers MCP tools.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -291,8 +292,12 @@ async def cleanup_recipe_impl(client: httpx.AsyncClient, recipe_slug: str) -> st
     recipe_name = recipe.get("name", recipe_slug)
     lines: list[str] = [f"=== Recipe Cleanup: {recipe_name} ===", ""]
 
-    foods = await get_all(client, "/api/foods")
-    units = await get_all(client, "/api/units")
+    foods, units, existing_tags, existing_cats = await asyncio.gather(
+        get_all(client, "/api/foods"),
+        get_all(client, "/api/units"),
+        get_all(client, "/api/organizers/tags"),
+        get_all(client, "/api/organizers/categories"),
+    )
     food_map = {normalize_food(f["name"]): f for f in foods}
     unit_map = {normalize_unit(u["name"]): u for u in units}
 
@@ -409,20 +414,33 @@ async def cleanup_recipe_impl(client: httpx.AsyncClient, recipe_slug: str) -> st
         text = (step.get("text") or "").replace("\n", " ")[:150]
         lines.append(f"  [{sid}]  {text}")
 
+    tag_names = sorted(t["name"] for t in existing_tags)
+    cat_names = sorted(c["name"] for c in existing_cats)
+
     lines += ["", "## Next Steps"]
     if flagged:
-        lines.append("1. Fix flagged ingredients (call fix_ingredient for each ⚠️ above):")
+        lines.append("Fix flagged ingredients first (call fix_ingredient for each ⚠️ above):")
         for ref, fname, reason in flagged:
             lines.append(
                 f"   fix_ingredient('{recipe_slug}', '{ref}', food_name='<corrected name>')"
                 f"  # {fname} — {reason}"
             )
-        lines.append("2. Then link steps:")
-        lines.append(f"   link_recipe_steps('{recipe_slug}', {{step_id: [ref_ids], ...}})")
+        lines.append("")
+
+    lines.append("Then apply all enrichments in one call:")
+    lines.append(f"   enrich_recipe('{recipe_slug}',")
+    lines.append("     step_ingredient_map={step_id: [ref_ids], ...},")
+    lines.append("     tags=['...'],")
+    lines.append("     categories=['...'],")
+    lines.append("   )")
+    if tag_names:
+        lines.append(f"   Existing tags: {', '.join(tag_names)}")
     else:
-        lines.append(
-            f"All ingredients look clean. Next: link_recipe_steps('{recipe_slug}', {{step_id: [ref_ids], ...}})"
-        )
+        lines.append("   No tags exist yet — any name you provide will be added automatically.")
+    if cat_names:
+        lines.append(f"   Existing categories: {', '.join(cat_names)}")
+    else:
+        lines.append("   No categories exist yet — any name you provide will be added automatically.")
 
     lines += ["", "=== Done ==="]
     return "\n".join(lines)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import httpx
@@ -674,4 +675,181 @@ def register_recipe_tools(mcp: Any, client: httpx.AsyncClient) -> None:
             lines.append(f"  {rname}  (slug: {slug})")
 
         lines.append(f"\n{len(suggestions)} suggestion(s)")
+        return "\n".join(lines)
+
+    @mcp.tool()
+    async def enrich_recipe(
+        recipe_slug: str,
+        step_ingredient_map: dict[str, list[str]] | None = None,
+        tags: list[str] | None = None,
+        categories: list[str] | None = None,
+        ingredient_fixes: list[dict] | None = None,
+    ) -> str:
+        """
+        Apply all post-import enrichments to a recipe in a single PUT.
+
+        After running cleanup_recipe or import_and_cleanup_recipe, call this
+        once with all decisions. A single PUT avoids the race condition that
+        occurs when link_recipe_steps, set_recipe_tags, and set_recipe_categories
+        each do their own independent GET → modify → PUT and the last write
+        silently drops the others' changes.
+
+        All parameters are optional — pass only what you want to change.
+
+        Args:
+            recipe_slug:         The recipe slug or ID.
+            step_ingredient_map: Dict mapping step ID → list of ingredient
+                                 referenceIds. Omitted steps are left unchanged.
+            tags:                Tag names to set (replaces existing tags).
+                                 Pass [] to clear all tags.
+            categories:          Category names to set (replaces existing).
+                                 Pass [] to clear all categories.
+            ingredient_fixes:    List of ingredient corrections. Each entry is a
+                                 dict with keys: reference_id (required),
+                                 food_name (required), unit_name, quantity,
+                                 note (all optional).
+
+        Returns:
+            Plain-text summary of every change applied and the final PUT status.
+        """
+        if not any([step_ingredient_map, tags is not None, categories is not None, ingredient_fixes]):
+            return "Nothing to do — provide at least one of: step_ingredient_map, tags, categories, ingredient_fixes"
+
+        try:
+            recipe = await get_recipe(client, recipe_slug)
+        except Exception as exc:
+            return f"ERROR: could not fetch recipe '{recipe_slug}': {exc}"
+
+        recipe_name = recipe.get("name", recipe_slug)
+        lines: list[str] = [f"=== Enrich Recipe: {recipe_name} ===", ""]
+
+        foods, units, existing_tags, existing_cats = await asyncio.gather(
+            get_all(client, "/api/foods"),
+            get_all(client, "/api/units"),
+            get_all(client, "/api/organizers/tags"),
+            get_all(client, "/api/organizers/categories"),
+        )
+        food_map = {normalize_food(f["name"]): f for f in foods}
+        unit_map = {normalize_unit(u["name"]): u for u in units}
+
+        # ── Ingredient fixes ──────────────────────────────────────────────────
+        if ingredient_fixes:
+            lines.append("## Ingredient Fixes")
+            ingredients: list[dict] = recipe.get("recipeIngredient") or []
+            ing_by_ref = {ing.get("referenceId"): ing for ing in ingredients}
+
+            for fix in ingredient_fixes:
+                ref_id = fix.get("reference_id") or fix.get("referenceId")
+                food_name_fix = fix.get("food_name") or fix.get("foodName", "")
+                unit_name_fix = fix.get("unit_name") or fix.get("unitName", "")
+                quantity_fix = fix.get("quantity")
+                note_fix = fix.get("note", "")
+
+                if not ref_id or not food_name_fix:
+                    lines.append(f"  WARN: skipping fix missing reference_id or food_name: {fix}")
+                    continue
+
+                ing = ing_by_ref.get(ref_id)
+                if ing is None:
+                    lines.append(f"  WARN: no ingredient with referenceId '{ref_id}'")
+                    continue
+
+                food, action = await find_or_create_food(client, food_name_fix, food_map)
+                if food is None:
+                    lines.append(f"  [{ref_id}] FAILED: could not find or create food '{food_name_fix}'")
+                    continue
+                ing["food"] = food
+                parts = [f"food '{food['name']}' [{action}]"]
+
+                if unit_name_fix:
+                    unit, u_action = await find_or_create_unit(client, unit_name_fix, unit_map)
+                    if unit:
+                        ing["unit"] = unit
+                        parts.append(f"unit '{unit['name']}' [{u_action}]")
+                    else:
+                        parts.append(f"unit '{unit_name_fix}' [FAILED]")
+
+                if quantity_fix is not None:
+                    ing["quantity"] = quantity_fix
+                    parts.append(f"quantity={quantity_fix}")
+
+                if note_fix:
+                    ing["note"] = note_fix
+                    parts.append(f"note='{note_fix}'")
+
+                lines.append(f"  [{ref_id}] {' | '.join(parts)}")
+
+            lines.append("")
+
+        # ── Step linking ──────────────────────────────────────────────────────
+        if step_ingredient_map:
+            lines.append("## Step Linking")
+            steps: list[dict] = recipe.get("recipeInstructions") or []
+            step_by_id = {s.get("id"): s for s in steps}
+            applied = 0
+
+            for sid in sorted(set(step_ingredient_map) - set(step_by_id)):
+                lines.append(f"  WARN: step ID not found in recipe — {sid}")
+
+            for step in steps:
+                sid = step.get("id")
+                if sid not in step_ingredient_map:
+                    continue
+                ref_ids = step_ingredient_map[sid]
+                step["ingredientReferences"] = [{"referenceId": r} for r in ref_ids]
+                text = (step.get("text") or "")[:80].replace("\n", " ")
+                lines.append(f"  [{sid}] {len(ref_ids)} ref(s) → {text}…")
+                applied += 1
+
+            lines.append(f"  {applied} step(s) updated")
+            lines.append("")
+
+        # ── Tags ──────────────────────────────────────────────────────────────
+        if tags is not None:
+            lines.append("## Tags")
+            tag_map = {t["name"].lower(): t for t in existing_tags}
+            resolved_tags: list[dict] = []
+            for name in tags:
+                tag = tag_map.get(name.lower())
+                if tag:
+                    resolved_tags.append(tag)
+                    lines.append(f"  '{name}' [found]")
+                else:
+                    try:
+                        r = await client.post("/api/organizers/tags", json={"name": name})
+                        r.raise_for_status()
+                        tag = r.json()
+                        resolved_tags.append(tag)
+                        lines.append(f"  '{name}' [created]")
+                    except Exception as exc:
+                        lines.append(f"  '{name}' [FAILED: {exc}]")
+            recipe["tags"] = resolved_tags
+            lines.append("")
+
+        # ── Categories ────────────────────────────────────────────────────────
+        if categories is not None:
+            lines.append("## Categories")
+            cat_map = {c["name"].lower(): c for c in existing_cats}
+            resolved_cats: list[dict] = []
+            for name in categories:
+                cat = cat_map.get(name.lower())
+                if cat:
+                    resolved_cats.append(cat)
+                    lines.append(f"  '{name}' [found]")
+                else:
+                    try:
+                        r = await client.post("/api/organizers/categories", json={"name": name})
+                        r.raise_for_status()
+                        cat = r.json()
+                        resolved_cats.append(cat)
+                        lines.append(f"  '{name}' [created]")
+                    except Exception as exc:
+                        lines.append(f"  '{name}' [FAILED: {exc}]")
+            recipe["recipeCategory"] = resolved_cats
+            lines.append("")
+
+        # ── Single PUT ────────────────────────────────────────────────────────
+        ok = await put_recipe(client, recipe_slug, recipe)
+        lines.append("PUT OK" if ok else "WARN: PUT failed — check Mealie logs")
+        lines.append("\n=== Done ===")
         return "\n".join(lines)

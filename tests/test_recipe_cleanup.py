@@ -799,3 +799,162 @@ async def test_suggest_recipes_by_name_partial_match_skips_unknown(mealie_http, 
         assert "xyzzy_nonexistent_xyz" in report, "Unresolved food should appear in note"
     finally:
         await mealie_http.delete(f"/api/foods/{food_id}")
+
+
+# ── Tests: enrich_recipe ───────────────────────────────────────────────────────
+
+
+async def test_enrich_recipe_tool_is_registered(mcp_server):
+    async with Client(mcp_server) as client:
+        tools = await client.list_tools()
+    assert any(t.name == "enrich_recipe" for t in tools)
+
+
+async def test_enrich_recipe_no_params_returns_message(mcp_server):
+    async with Client(mcp_server) as mcp:
+        result = await mcp.call_tool("enrich_recipe", {"recipe_slug": "any-slug"})
+    assert "nothing to do" in result.content[0].text.lower()
+
+
+async def test_enrich_recipe_sets_tags_and_categories(mealie_http, mcp_server):
+    """enrich_recipe applies tags and categories in a single PUT."""
+    slug = await _create_recipe(mealie_http, "Enrich: Tags and Categories")
+    try:
+        async with Client(mcp_server) as mcp:
+            result = await mcp.call_tool(
+                "enrich_recipe",
+                {
+                    "recipe_slug": slug,
+                    "tags": ["enrich-tag-a", "enrich-tag-b"],
+                    "categories": ["enrich-cat-x"],
+                },
+            )
+        report = result.content[0].text
+        assert "put ok" in report.lower(), f"Expected PUT OK:\n{report}"
+
+        recipe = await _get_recipe(mealie_http, slug)
+        tag_names = {t["name"] for t in (recipe.get("tags") or [])}
+        cat_names = {c["name"] for c in (recipe.get("recipeCategory") or [])}
+        assert "enrich-tag-a" in tag_names
+        assert "enrich-tag-b" in tag_names
+        assert "enrich-cat-x" in cat_names
+    finally:
+        await _delete_recipe(mealie_http, slug)
+
+
+async def test_enrich_recipe_links_steps(mealie_http, mcp_server):
+    """enrich_recipe applies step-ingredient mapping."""
+    ref_id = str(uuid.uuid4())
+    food_name = "enrich_step_food"
+    r = await mealie_http.post("/api/foods", json={"name": food_name})
+    r.raise_for_status()
+    food = r.json()
+
+    r = await mealie_http.post("/api/units", json={"name": "enrich_step_unit", "abbreviation": ""})
+    r.raise_for_status()
+    unit = r.json()
+
+    slug = await _create_recipe(mealie_http, "Enrich: Step Linking")
+    try:
+        await _set_ingredients(
+            mealie_http,
+            slug,
+            [_linked_ingredient(food, unit, ref_id=ref_id)],
+            instructions=[{"id": str(uuid.uuid4()), "text": "Do the thing.", "ingredientReferences": []}],
+        )
+        recipe = await _get_recipe(mealie_http, slug)
+        step_id = recipe["recipeInstructions"][0]["id"]
+
+        async with Client(mcp_server) as mcp:
+            result = await mcp.call_tool(
+                "enrich_recipe",
+                {"recipe_slug": slug, "step_ingredient_map": {step_id: [ref_id]}},
+            )
+        report = result.content[0].text
+        assert "put ok" in report.lower(), f"Expected PUT OK:\n{report}"
+
+        recipe = await _get_recipe(mealie_http, slug)
+        refs = recipe["recipeInstructions"][0].get("ingredientReferences") or []
+        assert any(r.get("referenceId") == ref_id for r in refs), f"referenceId not linked: {refs}"
+    finally:
+        await _delete_recipe(mealie_http, slug)
+        await _purge_foods(mealie_http, food_name)
+        await _purge_units(mealie_http, "enrich_step_unit")
+
+
+async def test_enrich_recipe_fixes_ingredient(mealie_http, mcp_server):
+    """enrich_recipe corrects a misidentified ingredient via ingredient_fixes."""
+    food_name = "enrich_fix_food"
+    await _purge_foods(mealie_http, food_name)
+    ref_id = str(uuid.uuid4())
+    slug = await _create_recipe(mealie_http, "Enrich: Ingredient Fix")
+    try:
+        await _set_ingredients(mealie_http, slug, [_note_ingredient("wrong text", ref_id=ref_id)])
+
+        async with Client(mcp_server) as mcp:
+            result = await mcp.call_tool(
+                "enrich_recipe",
+                {
+                    "recipe_slug": slug,
+                    "ingredient_fixes": [{"reference_id": ref_id, "food_name": food_name}],
+                },
+            )
+        report = result.content[0].text
+        assert "put ok" in report.lower(), f"Expected PUT OK:\n{report}"
+
+        recipe = await _get_recipe(mealie_http, slug)
+        ing = next(i for i in recipe["recipeIngredient"] if i.get("referenceId") == ref_id)
+        assert (ing.get("food") or {}).get("id"), f"Food ID null after enrich: {ing}"
+    finally:
+        await _delete_recipe(mealie_http, slug)
+        await _purge_foods(mealie_http, food_name, food_name.title())
+
+
+async def test_enrich_recipe_applies_all_in_single_put(mealie_http, mcp_server):
+    """All enrichments survive together — tags, categories, and step linking coexist."""
+    ref_id = str(uuid.uuid4())
+    food_name = "enrich_all_food"
+    r = await mealie_http.post("/api/foods", json={"name": food_name})
+    r.raise_for_status()
+    food = r.json()
+
+    r = await mealie_http.post("/api/units", json={"name": "enrich_all_unit", "abbreviation": ""})
+    r.raise_for_status()
+    unit = r.json()
+
+    slug = await _create_recipe(mealie_http, "Enrich: All Together")
+    try:
+        await _set_ingredients(
+            mealie_http,
+            slug,
+            [_linked_ingredient(food, unit, ref_id=ref_id)],
+            instructions=[{"id": str(uuid.uuid4()), "text": "Cook it.", "ingredientReferences": []}],
+        )
+        recipe = await _get_recipe(mealie_http, slug)
+        step_id = recipe["recipeInstructions"][0]["id"]
+
+        async with Client(mcp_server) as mcp:
+            result = await mcp.call_tool(
+                "enrich_recipe",
+                {
+                    "recipe_slug": slug,
+                    "step_ingredient_map": {step_id: [ref_id]},
+                    "tags": ["enrich-all-tag"],
+                    "categories": ["enrich-all-cat"],
+                },
+            )
+        report = result.content[0].text
+        assert "put ok" in report.lower(), f"Expected PUT OK:\n{report}"
+
+        recipe = await _get_recipe(mealie_http, slug)
+        tag_names = {t["name"] for t in (recipe.get("tags") or [])}
+        cat_names = {c["name"] for c in (recipe.get("recipeCategory") or [])}
+        refs = recipe["recipeInstructions"][0].get("ingredientReferences") or []
+
+        assert "enrich-all-tag" in tag_names, f"Tag missing: {tag_names}"
+        assert "enrich-all-cat" in cat_names, f"Category missing: {cat_names}"
+        assert any(r.get("referenceId") == ref_id for r in refs), f"Step link missing: {refs}"
+    finally:
+        await _delete_recipe(mealie_http, slug)
+        await _purge_foods(mealie_http, food_name)
+        await _purge_units(mealie_http, "enrich_all_unit")
