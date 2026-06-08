@@ -431,6 +431,189 @@ def register_recipe_tools(mcp: Any, client: httpx.AsyncClient) -> None:
         return result
 
     @mcp.tool()
+    async def get_all_recipes() -> str:
+        """
+        Return every recipe in the library as a flat list, auto-paginating.
+
+        Fetches all pages so the result size doesn't depend on Mealie's default
+        page limit. Returns name, slug, tags, and categories for each recipe.
+        For full ingredient and step data use get_recipes_detail.
+
+        Returns:
+            Plain-text list of all recipes with slug, tags, and categories.
+        """
+        recipes = await get_all(client, "/api/recipes")
+        if not recipes:
+            return "No recipes found."
+
+        lines = [f"=== All Recipes ({len(recipes)}) ===", ""]
+        for r in recipes:
+            slug = r.get("slug") or r.get("id", "?")
+            name = r.get("name", slug)
+            tags = ", ".join(t.get("name", "") for t in (r.get("tags") or []))
+            cats = ", ".join(c.get("name", "") for c in (r.get("recipeCategory") or []))
+            meta_parts = []
+            if tags:
+                meta_parts.append(f"tags: {tags}")
+            if cats:
+                meta_parts.append(f"categories: {cats}")
+            meta = f"  [{', '.join(meta_parts)}]" if meta_parts else ""
+            lines.append(f"  {name}  (slug: {slug}){meta}")
+
+        return "\n".join(lines)
+
+    @mcp.tool()
+    async def get_recipes_detail(slugs: list[str]) -> str:
+        """
+        Fetch full recipe detail for a list of slugs in one call.
+
+        Returns ingredients (with referenceId, food, unit, quantity), instruction
+        steps (with ID and text), tags, and categories for each slug. Use this
+        to inspect a targeted subset of recipes; for a full library listing use
+        get_all_recipes.
+
+        Args:
+            slugs: List of recipe slugs (or IDs) to fetch.
+
+        Returns:
+            Structured plain-text report for each recipe, including an ERROR
+            line for any slug that could not be fetched.
+        """
+        lines = [f"=== Recipe Detail: {len(slugs)} recipe(s) ==="]
+        for slug in slugs:
+            lines.append("")
+            try:
+                recipe = await get_recipe(client, slug)
+            except Exception as exc:
+                lines.append(f"## {slug}")
+                lines.append(f"  ERROR: could not fetch: {exc}")
+                continue
+
+            name = recipe.get("name", slug)
+            lines.append(f"## {name}  (slug: {recipe.get('slug', slug)})")
+
+            tags = ", ".join(t.get("name", "") for t in (recipe.get("tags") or []))
+            cats = ", ".join(c.get("name", "") for c in (recipe.get("recipeCategory") or []))
+            if tags:
+                lines.append(f"  Tags: {tags}")
+            if cats:
+                lines.append(f"  Categories: {cats}")
+
+            ingredients: list[dict] = recipe.get("recipeIngredient") or []
+            lines.append(f"  Ingredients ({len(ingredients)}):")
+            for ing in ingredients:
+                ref = ing.get("referenceId", "?")
+                qty = ing.get("quantity") or ""
+                uname = (ing.get("unit") or {}).get("name") or ""
+                fname = (ing.get("food") or {}).get("name") or (ing.get("note") or "").strip() or "?"
+                linked = "✓" if (ing.get("food") or {}).get("id") else "✗"
+                qty_str = f"{qty} {uname}".strip()
+                lines.append(f"    [{ref}] {linked} {qty_str} {fname}".rstrip())
+
+            steps: list[dict] = recipe.get("recipeInstructions") or []
+            lines.append(f"  Steps ({len(steps)}):")
+            for step in steps:
+                sid = step.get("id", "?")
+                text = (step.get("text") or "").replace("\n", " ")[:120]
+                refs = [ref.get("referenceId") for ref in (step.get("ingredientReferences") or [])]
+                ref_note = f"  → {refs}" if refs else ""
+                lines.append(f"    [{sid}] {text}{ref_note}")
+
+        return "\n".join(lines)
+
+    @mcp.tool()
+    async def set_recipe_tags(recipe_slug: str, tag_names: list[str]) -> str:
+        """
+        Set tags on a recipe by name, creating any tags that don't exist yet.
+
+        Replaces the recipe's current tag list with exactly the tags you provide.
+        Tag names are matched case-insensitively. Pass an empty list to clear
+        all tags.
+
+        Args:
+            recipe_slug: The recipe slug or ID.
+            tag_names:   List of tag names to set. Order is not preserved.
+
+        Returns:
+            Plain-text summary of each tag (found/created/failed) and PATCH status.
+        """
+        try:
+            recipe = await get_recipe(client, recipe_slug)
+        except Exception as exc:
+            return f"ERROR: could not fetch recipe '{recipe_slug}': {exc}"
+
+        existing = await get_all(client, "/api/organizers/tags")
+        tag_map = {t["name"].lower(): t for t in existing}
+
+        resolved: list[dict] = []
+        lines = [f"=== Set Tags: {recipe.get('name', recipe_slug)} ===", ""]
+        for name in tag_names:
+            tag = tag_map.get(name.lower())
+            if tag:
+                resolved.append(tag)
+                lines.append(f"  '{name}' [found]")
+            else:
+                try:
+                    r = await client.post("/api/organizers/tags", json={"name": name})
+                    r.raise_for_status()
+                    tag = r.json()
+                    resolved.append(tag)
+                    lines.append(f"  '{name}' [created]")
+                except Exception as exc:
+                    lines.append(f"  '{name}' [FAILED: {exc}]")
+
+        recipe["tags"] = resolved
+        ok = await put_recipe(client, recipe_slug, recipe)
+        lines += ["", "PATCH OK" if ok else "WARN: patch failed — check Mealie logs"]
+        return "\n".join(lines)
+
+    @mcp.tool()
+    async def set_recipe_categories(recipe_slug: str, category_names: list[str]) -> str:
+        """
+        Set categories on a recipe by name, creating any that don't exist yet.
+
+        Replaces the recipe's current category list with exactly the categories
+        you provide. Names are matched case-insensitively. Pass an empty list to
+        clear all categories.
+
+        Args:
+            recipe_slug:     The recipe slug or ID.
+            category_names:  List of category names to set.
+
+        Returns:
+            Plain-text summary of each category (found/created/failed) and PATCH status.
+        """
+        try:
+            recipe = await get_recipe(client, recipe_slug)
+        except Exception as exc:
+            return f"ERROR: could not fetch recipe '{recipe_slug}': {exc}"
+
+        existing = await get_all(client, "/api/organizers/categories")
+        cat_map = {c["name"].lower(): c for c in existing}
+
+        resolved: list[dict] = []
+        lines = [f"=== Set Categories: {recipe.get('name', recipe_slug)} ===", ""]
+        for name in category_names:
+            cat = cat_map.get(name.lower())
+            if cat:
+                resolved.append(cat)
+                lines.append(f"  '{name}' [found]")
+            else:
+                try:
+                    r = await client.post("/api/organizers/categories", json={"name": name})
+                    r.raise_for_status()
+                    cat = r.json()
+                    resolved.append(cat)
+                    lines.append(f"  '{name}' [created]")
+                except Exception as exc:
+                    lines.append(f"  '{name}' [FAILED: {exc}]")
+
+        recipe["recipeCategory"] = resolved
+        ok = await put_recipe(client, recipe_slug, recipe)
+        lines += ["", "PATCH OK" if ok else "WARN: patch failed — check Mealie logs"]
+        return "\n".join(lines)
+
+    @mcp.tool()
     async def suggest_recipes_by_name(food_names: list[str], limit: int = 10) -> str:
         """
         Suggest recipes based on food/ingredient names you have available.
