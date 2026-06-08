@@ -97,6 +97,36 @@ _UNIT_ALIASES: dict[str, str] = {
 }
 
 
+# Maps canonical unit name → (family, factor_to_base).
+# Factor is "how many base units are in this unit".
+# Units not listed here are count/descriptive and cannot be converted.
+_UNIT_FAMILIES: dict[str, tuple[str, float]] = {
+    # US Volume — base: teaspoon
+    "teaspoon":    ("us_volume", 1.0),
+    "tablespoon":  ("us_volume", 3.0),
+    "cup":         ("us_volume", 48.0),
+    "fluid ounce": ("us_volume", 6.0),
+    "pint":        ("us_volume", 96.0),
+    "quart":       ("us_volume", 192.0),
+    "gallon":      ("us_volume", 768.0),
+    # Metric Volume — base: milliliter
+    "milliliter":  ("metric_volume", 1.0),
+    "liter":       ("metric_volume", 1000.0),
+    # Imperial Weight — base: ounce
+    "ounce":       ("imperial_weight", 1.0),
+    "pound":       ("imperial_weight", 16.0),
+    # Metric Weight — base: gram
+    "milligram":   ("metric_weight", 0.001),
+    "gram":        ("metric_weight", 1.0),
+    "kilogram":    ("metric_weight", 1000.0),
+}
+
+
+def unit_family_and_factor(canonical_name: str) -> tuple[str, float] | None:
+    """Return (family, factor_to_base) for a canonical unit name, or None."""
+    return _UNIT_FAMILIES.get(canonical_name)
+
+
 # ── Normalization ──────────────────────────────────────────────────────────────
 
 def normalize_food(name: str) -> str:
