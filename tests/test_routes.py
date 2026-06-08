@@ -23,6 +23,10 @@ REQUIRED_ENDPOINTS: list[tuple[str, str]] = [
     ("delete", "/api/households/shopping/items"),
     # replace_shopping_list_from_recipes — recipe ingredient expansion
     ("post",   "/api/households/shopping/lists/{item_id}/recipe/{recipe_id}"),
+    # set_food_label — label lookup and food update
+    ("get",    "/api/groups/labels"),
+    ("get",    "/api/foods/{item_id}"),
+    ("put",    "/api/foods/{item_id}"),
 ]
 
 

@@ -22,6 +22,7 @@ INCLUDE_PATTERNS: list[str] = [
     r"^/api/organizers/tags",             # recipe tags
     r"^/api/foods",                       # food database
     r"^/api/units",                       # measurement units
+    r"^/api/groups/labels",              # multi-purpose labels (shopping grouping)
 ]
 
 

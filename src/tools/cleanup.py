@@ -17,6 +17,38 @@ from utils import (
 )
 
 
+# ── Name-lookup helpers ───────────────────────────────────────────────────────
+
+def _find_food(foods: list[dict], query: str) -> dict | None:
+    """Find a food by name: exact → case-insensitive → normalized."""
+    for f in foods:
+        if f["name"] == query:
+            return f
+    for f in foods:
+        if f["name"].lower() == query.lower():
+            return f
+    normalized = normalize_food(query)
+    for f in foods:
+        if normalize_food(f["name"]) == normalized:
+            return f
+    return None
+
+
+def _find_unit(units: list[dict], query: str) -> dict | None:
+    """Find a unit by name: exact → case-insensitive → normalized."""
+    for u in units:
+        if u["name"] == query:
+            return u
+    for u in units:
+        if u["name"].lower() == query.lower():
+            return u
+    normalized = normalize_unit(query)
+    for u in units:
+        if normalize_unit(u["name"]) == normalized:
+            return u
+    return None
+
+
 # ── Helpers used only by cleanup_system ───────────────────────────────────────
 
 async def _backup(client: httpx.AsyncClient) -> str:
@@ -252,6 +284,124 @@ def register_cleanup_tools(mcp: Any, client: httpx.AsyncClient) -> None:
         return "\n".join(lines)
 
     @mcp.tool()
+    async def set_food_label(food_name: str, label_name: str) -> str:
+        """
+        Assign a label to a food by name.
+
+        Labels on foods flow automatically to shopping list items when recipes
+        are expanded, grouping them visually in the shopping UI (e.g. "Produce",
+        "Dairy", "Meat"). Both food and label are matched case-insensitively.
+
+        The label must already exist — create one first via the
+        create_multi_purpose_label tool if needed.
+
+        Args:
+            food_name:  Name of the food to label (case-insensitive).
+            label_name: Name of the label to assign (case-insensitive).
+
+        Returns:
+            Success message or error description.
+        """
+        foods = await get_all(client, "/api/foods")
+        food = next(
+            (f for f in foods if normalize_food(f["name"]) == normalize_food(food_name)),
+            None,
+        )
+        if food is None:
+            return f"ERROR: food '{food_name}' not found"
+
+        r = await client.get("/api/groups/labels", params={"perPage": 200})
+        if not r.is_success:
+            return f"ERROR: could not fetch labels — HTTP {r.status_code}"
+        labels = r.json().get("items", [])
+        label = next((lbl for lbl in labels if lbl["name"].lower() == label_name.lower()), None)
+        if label is None:
+            available = ", ".join(lbl["name"] for lbl in labels[:10])
+            hint = f" Available: {available}" if available else ""
+            return f"ERROR: label '{label_name}' not found.{hint}"
+
+        food_r = await client.get(f"/api/foods/{food['id']}")
+        if not food_r.is_success:
+            return f"ERROR: could not fetch food details — HTTP {food_r.status_code}"
+        full_food = food_r.json()
+        full_food["labelId"] = label["id"]
+
+        put_r = await client.put(f"/api/foods/{food['id']}", json=full_food)
+        if put_r.is_success:
+            return f"Assigned label '{label['name']}' to food '{full_food['name']}'"
+        return f"ERROR: update failed — HTTP {put_r.status_code}"
+
+    @mcp.tool()
+    async def assign_food_labels(assignments: dict[str, list[str]]) -> str:
+        """
+        Assign labels to multiple foods in bulk.
+
+        More efficient than repeated set_food_label calls because all foods and
+        all labels are fetched only once. Labels and foods are matched
+        case-insensitively. Labels must already exist — create them first via
+        the create_multi_purpose_label tool.
+
+        Labels on foods flow automatically to shopping list items when recipes
+        are expanded, grouping them visually in the shopping UI.
+
+        Args:
+            assignments: Dict mapping each label name to the list of food names
+                         to assign it to. Example:
+                           {"Produce": ["Carrot", "Onion", "Garlic"],
+                            "Dairy":   ["Milk", "Butter", "Cheese"]}
+
+        Returns:
+            Plain-text report of each food updated, with errors for any foods
+            or labels that could not be found.
+        """
+        foods = await get_all(client, "/api/foods")
+
+        r = await client.get("/api/groups/labels", params={"perPage": 200})
+        if not r.is_success:
+            return f"ERROR: could not fetch labels — HTTP {r.status_code}"
+        labels = r.json().get("items", [])
+        label_map = {lbl["name"].lower(): lbl for lbl in labels}
+
+        lines = ["=== Assign Food Labels ===", ""]
+        ok_count = err_count = 0
+
+        for label_name, food_names in assignments.items():
+            label = label_map.get(label_name.lower())
+            if label is None:
+                lines.append(f"## '{label_name}' — NOT FOUND (skipping {len(food_names)} food(s))")
+                err_count += len(food_names)
+                lines.append("")
+                continue
+
+            lines.append(f"## {label['name']}")
+            for food_name in food_names:
+                food = _find_food(foods, food_name)
+                if food is None:
+                    lines.append(f"  '{food_name}' — NOT FOUND")
+                    err_count += 1
+                    continue
+
+                food_r = await client.get(f"/api/foods/{food['id']}")
+                if not food_r.is_success:
+                    lines.append(f"  '{food_name}' — fetch failed (HTTP {food_r.status_code})")
+                    err_count += 1
+                    continue
+
+                full_food = food_r.json()
+                full_food["labelId"] = label["id"]
+                put_r = await client.put(f"/api/foods/{food['id']}", json=full_food)
+                if put_r.is_success:
+                    lines.append(f"  '{full_food['name']}' — OK")
+                    ok_count += 1
+                else:
+                    lines.append(f"  '{full_food['name']}' — update failed (HTTP {put_r.status_code})")
+                    err_count += 1
+            lines.append("")
+
+        lines.append(f"=== {ok_count} assigned · {err_count} failed ===")
+        return "\n".join(lines)
+
+    @mcp.tool()
     async def merge_foods(keep_name: str, remove_name: str) -> str:
         """
         Merge two food entries by name.
@@ -268,10 +418,8 @@ def register_cleanup_tools(mcp: Any, client: httpx.AsyncClient) -> None:
             Success or error message.
         """
         foods = await get_all(client, "/api/foods")
-        name_map = {normalize_food(f["name"]): f for f in foods}
-
-        keep = name_map.get(normalize_food(keep_name))
-        remove = name_map.get(normalize_food(remove_name))
+        keep = _find_food(foods, keep_name)
+        remove = _find_food(foods, remove_name)
 
         if keep is None:
             return f"ERROR: food '{keep_name}' not found in database"
@@ -302,10 +450,8 @@ def register_cleanup_tools(mcp: Any, client: httpx.AsyncClient) -> None:
             Success or error message.
         """
         units = await get_all(client, "/api/units")
-        name_map = {normalize_unit(u["name"]): u for u in units}
-
-        keep = name_map.get(normalize_unit(keep_name))
-        remove = name_map.get(normalize_unit(remove_name))
+        keep = _find_unit(units, keep_name)
+        remove = _find_unit(units, remove_name)
 
         if keep is None:
             return f"ERROR: unit '{keep_name}' not found in database"
