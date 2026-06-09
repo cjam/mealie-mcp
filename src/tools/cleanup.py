@@ -616,6 +616,208 @@ def register_cleanup_tools(mcp: Any, client: httpx.AsyncClient) -> None:
         return "ERROR: delete failed — check Mealie logs"
 
     @mcp.tool()
+    async def delete_many_foods(food_names: list[str]) -> str:
+        """
+        Delete multiple food entries by name in a single call.
+
+        Equivalent to calling delete_food repeatedly, but with one fetch of the
+        food list. Use this to bulk-remove junk entries identified by
+        list_unlabeled_foods or a manual review. Foods are matched
+        case-insensitively.
+
+        Note: deleting foods still referenced by recipe ingredients leaves those
+        ingredients without a food link. Prefer merge_many_foods when a canonical
+        entry exists.
+
+        Args:
+            food_names: List of food names to delete.
+
+        Returns:
+            Plain-text report with one line per food plus a summary count.
+        """
+        foods = await get_all(client, "/api/foods")
+        lines: list[str] = ["=== Delete Many Foods ===", ""]
+        deleted = not_found = failed = 0
+
+        for name in food_names:
+            food = _find_food(foods, name)
+            if food is None:
+                lines.append(f"  '{name}' — NOT FOUND")
+                not_found += 1
+                continue
+            ok = await _delete(client, "/api/foods", food["id"])
+            if ok:
+                lines.append(f"  '{food['name']}' — deleted")
+                deleted += 1
+            else:
+                lines.append(f"  '{food['name']}' — delete failed")
+                failed += 1
+
+        parts = []
+        if deleted:
+            parts.append(f"{deleted} deleted")
+        if not_found:
+            parts.append(f"{not_found} not found")
+        if failed:
+            parts.append(f"{failed} failed")
+        lines += ["", f"=== {' · '.join(parts) or 'nothing to do'} ==="]
+        return "\n".join(lines)
+
+    @mcp.tool()
+    async def merge_many_foods(merges: list[dict]) -> str:
+        """
+        Merge multiple food pairs in a single call.
+
+        Equivalent to calling merge_foods repeatedly, but fetches the food list
+        only once. Each pair redirects all recipe ingredients from remove_name
+        to keep_name, then removes the duplicate. Use this after identifying
+        batches of duplicates via cleanup_system or manual review.
+
+        Args:
+            merges: List of merge specs, each a dict with:
+                      keep_name   — the food name to keep (surviving entry)
+                      remove_name — the food name to absorb (will be deleted)
+                    Example:
+                      [{"keep_name": "Garlic", "remove_name": "garlic clove"},
+                       {"keep_name": "Milk",   "remove_name": "whole milk"}]
+
+        Returns:
+            Plain-text report with one line per pair plus a summary count.
+        """
+        foods = await get_all(client, "/api/foods")
+        lines: list[str] = ["=== Merge Many Foods ===", ""]
+        merged = failed = 0
+
+        for spec in merges:
+            keep_name = spec.get("keep_name", "")
+            remove_name = spec.get("remove_name", "")
+            keep = _find_food(foods, keep_name)
+            remove = _find_food(foods, remove_name)
+
+            if keep is None:
+                lines.append(f"  '{keep_name}' / '{remove_name}' — ERROR: keep not found")
+                failed += 1
+                continue
+            if remove is None:
+                lines.append(f"  '{keep_name}' / '{remove_name}' — ERROR: remove not found")
+                failed += 1
+                continue
+            if keep["id"] == remove["id"]:
+                lines.append(f"  '{keep_name}' / '{remove_name}' — ERROR: same entry")
+                failed += 1
+                continue
+
+            ok = await _merge_foods(client, remove["id"], keep["id"])
+            if ok:
+                lines.append(f"  '{remove['name']}' → '{keep['name']}' — merged")
+                merged += 1
+                # refresh the food list so subsequent pairs see the updated state
+                foods = [f for f in foods if f["id"] != remove["id"]]
+            else:
+                lines.append(f"  '{remove['name']}' → '{keep['name']}' — merge failed")
+                failed += 1
+
+        parts = []
+        if merged:
+            parts.append(f"{merged} merged")
+        if failed:
+            parts.append(f"{failed} failed")
+        lines += ["", f"=== {' · '.join(parts) or 'nothing to do'} ==="]
+        return "\n".join(lines)
+
+    @mcp.tool()
+    async def update_many_foods(updates: list[dict]) -> str:
+        """
+        Rename and/or relabel multiple foods in a single call.
+
+        Equivalent to calling update_food repeatedly, but fetches the food list
+        and label list only once. At least one of new_name or label_name must be
+        present in each update spec. Foods and labels are matched
+        case-insensitively.
+
+        Args:
+            updates: List of update specs, each a dict with:
+                       food_name  — current name of the food (required)
+                       new_name   — optional new display name
+                       label_name — optional label name to assign
+                     Example:
+                       [{"food_name": "Tumeric",  "new_name": "Turmeric"},
+                        {"food_name": "Capsicum", "new_name": "Bell Pepper",
+                         "label_name": "Produce"}]
+
+        Returns:
+            Plain-text report with one line per food plus a summary count.
+        """
+        foods = await get_all(client, "/api/foods")
+
+        r = await client.get("/api/groups/labels", params={"perPage": 200})
+        labels_ok = r.is_success
+        label_map = {lbl["name"].lower(): lbl for lbl in r.json().get("items", [])} if labels_ok else {}
+
+        lines: list[str] = ["=== Update Many Foods ===", ""]
+        updated = failed = 0
+
+        for spec in updates:
+            food_name = spec.get("food_name", "")
+            new_name = spec.get("new_name")
+            label_name = spec.get("label_name")
+
+            if new_name is None and label_name is None:
+                lines.append(f"  '{food_name}' — SKIP: no new_name or label_name provided")
+                failed += 1
+                continue
+
+            food = _find_food(foods, food_name)
+            if food is None:
+                lines.append(f"  '{food_name}' — NOT FOUND")
+                failed += 1
+                continue
+
+            food_r = await client.get(f"/api/foods/{food['id']}")
+            if not food_r.is_success:
+                lines.append(f"  '{food_name}' — fetch failed (HTTP {food_r.status_code})")
+                failed += 1
+                continue
+            full_food = food_r.json()
+            changes: list[str] = []
+
+            if new_name is not None:
+                old = full_food["name"]
+                full_food["name"] = new_name.strip()
+                changes.append(f"name '{old}' → '{new_name.strip()}'")
+
+            if label_name is not None:
+                if not labels_ok:
+                    lines.append(f"  '{food_name}' — ERROR: could not fetch labels")
+                    failed += 1
+                    continue
+                label = label_map.get(label_name.lower())
+                if label is None:
+                    lines.append(f"  '{food_name}' — ERROR: label '{label_name}' not found")
+                    failed += 1
+                    continue
+                full_food["labelId"] = label["id"]
+                changes.append(f"label → '{label['name']}'")
+
+            put_r = await client.put(f"/api/foods/{food['id']}", json=full_food)
+            if put_r.is_success:
+                lines.append(f"  '{food['name']}' — {', '.join(changes)}")
+                updated += 1
+                # keep local list consistent for any subsequent lookups
+                food["name"] = full_food["name"]
+            else:
+                lines.append(f"  '{food['name']}' — update failed (HTTP {put_r.status_code})")
+                failed += 1
+
+        parts = []
+        if updated:
+            parts.append(f"{updated} updated")
+        if failed:
+            parts.append(f"{failed} failed")
+        lines += ["", f"=== {' · '.join(parts) or 'nothing to do'} ==="]
+        return "\n".join(lines)
+
+    @mcp.tool()
     async def list_unlabeled_foods() -> str:
         """
         Return all foods that have no label assigned (labelId is null).

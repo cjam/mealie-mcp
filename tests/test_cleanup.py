@@ -286,3 +286,148 @@ async def test_merge_units_unknown_remove(mealie_http, mcp_server):
         assert "ERROR" in result.content[0].text
     finally:
         await _purge_units(mealie_http, "cup")
+
+
+# ── delete_many_foods ─────────────────────────────────────────────────────────
+
+async def test_delete_many_foods_is_registered(mcp_server):
+    async with Client(mcp_server) as client:
+        tools = await client.list_tools()
+    assert any(t.name == "delete_many_foods" for t in tools)
+
+
+async def test_delete_many_foods_removes_all(mealie_http, mcp_server):
+    """delete_many_foods removes every listed food."""
+    await _purge_foods(mealie_http, "JunkA", "JunkB")
+    await _create_food(mealie_http, "JunkA")
+    await _create_food(mealie_http, "JunkB")
+    try:
+        async with Client(mcp_server) as client:
+            result = await client.call_tool(
+                "delete_many_foods", {"food_names": ["JunkA", "JunkB"]}
+            )
+        report = result.content[0].text
+        assert "2 deleted" in report, f"Unexpected report: {report}"
+        names = await _food_names(mealie_http)
+        assert "JunkA" not in names and "JunkB" not in names
+    finally:
+        await _purge_foods(mealie_http, "JunkA", "JunkB")
+
+
+async def test_delete_many_foods_partial_not_found(mealie_http, mcp_server):
+    """delete_many_foods reports errors for unknown names, still deletes known ones."""
+    await _purge_foods(mealie_http, "RealFood")
+    await _create_food(mealie_http, "RealFood")
+    try:
+        async with Client(mcp_server) as client:
+            result = await client.call_tool(
+                "delete_many_foods",
+                {"food_names": ["RealFood", "nonexistent_food_xyz"]},
+            )
+        report = result.content[0].text
+        assert "1 deleted" in report
+        assert "1 not found" in report
+        names = await _food_names(mealie_http)
+        assert "RealFood" not in names
+    finally:
+        await _purge_foods(mealie_http, "RealFood")
+
+
+# ── merge_many_foods ──────────────────────────────────────────────────────────
+
+async def test_merge_many_foods_is_registered(mcp_server):
+    async with Client(mcp_server) as client:
+        tools = await client.list_tools()
+    assert any(t.name == "merge_many_foods" for t in tools)
+
+
+async def test_merge_many_foods_merges_all_pairs(mealie_http, mcp_server):
+    """merge_many_foods absorbs each remove_name into its keep_name."""
+    await _purge_foods(mealie_http, "Basil", "basil", "Oregano", "oregano")
+    await _create_food(mealie_http, "Basil")
+    await _create_food(mealie_http, "basil")
+    await _create_food(mealie_http, "Oregano")
+    await _create_food(mealie_http, "oregano")
+    try:
+        async with Client(mcp_server) as client:
+            result = await client.call_tool(
+                "merge_many_foods",
+                {
+                    "merges": [
+                        {"keep_name": "Basil", "remove_name": "basil"},
+                        {"keep_name": "Oregano", "remove_name": "oregano"},
+                    ]
+                },
+            )
+        report = result.content[0].text
+        assert "2 merged" in report, f"Unexpected report: {report}"
+        names = await _food_names(mealie_http)
+        basil_variants = [n for n in names if n.lower() == "basil"]
+        oregano_variants = [n for n in names if n.lower() == "oregano"]
+        assert len(basil_variants) == 1
+        assert len(oregano_variants) == 1
+    finally:
+        await _purge_foods(mealie_http, "Basil", "basil", "Oregano", "oregano")
+
+
+async def test_merge_many_foods_partial_error(mcp_server):
+    """merge_many_foods reports errors for unknown names without aborting valid pairs."""
+    async with Client(mcp_server) as client:
+        result = await client.call_tool(
+            "merge_many_foods",
+            {
+                "merges": [
+                    {"keep_name": "nonexistent_keep_xyz", "remove_name": "nonexistent_remove_xyz"},
+                ]
+            },
+        )
+    assert "ERROR" in result.content[0].text or "1 failed" in result.content[0].text
+
+
+# ── update_many_foods ─────────────────────────────────────────────────────────
+
+async def test_update_many_foods_is_registered(mcp_server):
+    async with Client(mcp_server) as client:
+        tools = await client.list_tools()
+    assert any(t.name == "update_many_foods" for t in tools)
+
+
+async def test_update_many_foods_renames_all(mealie_http, mcp_server):
+    """update_many_foods renames each listed food."""
+    await _purge_foods(mealie_http, "Tumeric", "Turmeric", "Cilantro", "Coriander Leaf")
+    await _create_food(mealie_http, "Tumeric")
+    await _create_food(mealie_http, "Cilantro")
+    try:
+        async with Client(mcp_server) as client:
+            result = await client.call_tool(
+                "update_many_foods",
+                {
+                    "updates": [
+                        {"food_name": "Tumeric", "new_name": "Turmeric"},
+                        {"food_name": "Cilantro", "new_name": "Coriander Leaf"},
+                    ]
+                },
+            )
+        report = result.content[0].text
+        assert "2 updated" in report, f"Unexpected report: {report}"
+        names = await _food_names(mealie_http)
+        assert "Turmeric" in names
+        assert "Coriander Leaf" in names
+        assert "Tumeric" not in names
+        assert "Cilantro" not in names
+    finally:
+        await _purge_foods(mealie_http, "Tumeric", "Turmeric", "Cilantro", "Coriander Leaf")
+
+
+async def test_update_many_foods_partial_not_found(mcp_server):
+    """update_many_foods reports errors for unknown foods without aborting valid ones."""
+    async with Client(mcp_server) as client:
+        result = await client.call_tool(
+            "update_many_foods",
+            {
+                "updates": [
+                    {"food_name": "nonexistent_food_xyz", "new_name": "Something"},
+                ]
+            },
+        )
+    assert "1 failed" in result.content[0].text or "ERROR" in result.content[0].text
