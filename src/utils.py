@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from typing import Any
 
 import httpx
@@ -147,6 +148,35 @@ def normalize_unit(name: str) -> str:
         return _UNIT_ALIASES[raw]
     lower = raw.lower()
     return _UNIT_ALIASES.get(lower, lower)
+
+
+_CANONICAL_UNIT_NAMES: frozenset[str] = frozenset(u["name"] for u in STANDARD_UNITS)
+
+
+def detect_unit_in_text(text: str) -> str | None:
+    """Return the canonical unit name if text contains a recognized unit word, else None.
+
+    Checks two-word phrases first (e.g. 'fl oz') then individual tokens.
+    Single-char abbreviations like 'g', 'c', 'L' are included.
+    """
+    if not text:
+        return None
+    words = re.split(r"[\s,]+", text)
+    # Two-word phrases first (covers "fl oz", "fl. oz.", "fluid ounce", etc.)
+    for i in range(len(words) - 1):
+        phrase = f"{words[i]} {words[i + 1]}"
+        canonical = normalize_unit(phrase)
+        if canonical in _CANONICAL_UNIT_NAMES:
+            return canonical
+    # Single tokens
+    for word in words:
+        token = word.strip(".()")
+        if not token:
+            continue
+        canonical = normalize_unit(token)
+        if canonical in _CANONICAL_UNIT_NAMES:
+            return canonical
+    return None
 
 
 # ── Generic HTTP helpers ───────────────────────────────────────────────────────

@@ -466,6 +466,183 @@ def register_cleanup_tools(mcp: Any, client: httpx.AsyncClient) -> None:
         return "ERROR: merge failed — check Mealie logs"
 
     @mcp.tool()
+    async def create_food(name: str, label_name: str | None = None) -> str:
+        """
+        Create a new food entry, optionally assigning a label in the same call.
+
+        Use this when a food doesn't exist yet and you need it before labeling or
+        before running assign_food_labels. If the food already exists the call
+        still succeeds and returns the existing entry's name rather than creating
+        a duplicate.
+
+        Args:
+            name:       Display name for the food (stored as given; Title Case
+                        recommended for consistency).
+            label_name: Optional. Name of an existing label to assign immediately.
+                        The label must already exist — create one via
+                        create_multi_purpose_label if needed. Case-insensitive.
+
+        Returns:
+            Success message describing what was created/found and labeled, or an
+            error description.
+        """
+        foods = await get_all(client, "/api/foods")
+        existing = _find_food(foods, name)
+
+        if existing:
+            food = existing
+            created = False
+        else:
+            r = await client.post("/api/foods", json={"name": name.strip()})
+            if not r.is_success:
+                return f"ERROR: could not create food '{name}' — HTTP {r.status_code}"
+            food = r.json()
+            created = True
+
+        action = "Created" if created else "Found existing"
+        msg = f"{action} food '{food['name']}'"
+
+        if label_name is None:
+            return msg
+
+        r = await client.get("/api/groups/labels", params={"perPage": 200})
+        if not r.is_success:
+            return f"{msg} — ERROR: could not fetch labels (HTTP {r.status_code})"
+        labels = r.json().get("items", [])
+        label = next((lbl for lbl in labels if lbl["name"].lower() == label_name.lower()), None)
+        if label is None:
+            available = ", ".join(lbl["name"] for lbl in labels[:10])
+            hint = f" Available: {available}" if available else ""
+            return f"{msg} — ERROR: label '{label_name}' not found.{hint}"
+
+        food_r = await client.get(f"/api/foods/{food['id']}")
+        if not food_r.is_success:
+            return f"{msg} — ERROR: could not fetch food details (HTTP {food_r.status_code})"
+        full_food = food_r.json()
+        full_food["labelId"] = label["id"]
+        put_r = await client.put(f"/api/foods/{food['id']}", json=full_food)
+        if put_r.is_success:
+            return f"{msg} and assigned label '{label['name']}'"
+        return f"{msg} — ERROR: label assignment failed (HTTP {put_r.status_code})"
+
+    @mcp.tool()
+    async def update_food(
+        food_name: str,
+        new_name: str | None = None,
+        label_name: str | None = None,
+    ) -> str:
+        """
+        Rename a food and/or reassign its label without touching the raw API.
+
+        At least one of new_name or label_name must be provided. Use this to fix
+        typos (e.g. "Tumeric" → "Turmeric") or to move a food to a different label
+        group. The food is matched case-insensitively.
+
+        Args:
+            food_name:  Current name of the food to update (case-insensitive).
+            new_name:   Optional new display name. Replaces the existing name.
+            label_name: Optional label name to assign. Must already exist.
+                        Case-insensitive. Pass an existing label name to reassign,
+                        or call create_multi_purpose_label first if the label is new.
+
+        Returns:
+            Success message listing what changed, or an error description.
+        """
+        if new_name is None and label_name is None:
+            return "ERROR: supply at least one of new_name or label_name"
+
+        foods = await get_all(client, "/api/foods")
+        food = _find_food(foods, food_name)
+        if food is None:
+            return f"ERROR: food '{food_name}' not found"
+
+        food_r = await client.get(f"/api/foods/{food['id']}")
+        if not food_r.is_success:
+            return f"ERROR: could not fetch food details — HTTP {food_r.status_code}"
+        full_food = food_r.json()
+
+        changes: list[str] = []
+
+        if new_name is not None:
+            old = full_food["name"]
+            full_food["name"] = new_name.strip()
+            changes.append(f"name '{old}' → '{new_name.strip()}'")
+
+        if label_name is not None:
+            r = await client.get("/api/groups/labels", params={"perPage": 200})
+            if not r.is_success:
+                return f"ERROR: could not fetch labels — HTTP {r.status_code}"
+            labels = r.json().get("items", [])
+            label = next((lbl for lbl in labels if lbl["name"].lower() == label_name.lower()), None)
+            if label is None:
+                available = ", ".join(lbl["name"] for lbl in labels[:10])
+                hint = f" Available: {available}" if available else ""
+                return f"ERROR: label '{label_name}' not found.{hint}"
+            full_food["labelId"] = label["id"]
+            changes.append(f"label → '{label['name']}'")
+
+        put_r = await client.put(f"/api/foods/{food['id']}", json=full_food)
+        if put_r.is_success:
+            return f"Updated food '{food['name']}': {', '.join(changes)}"
+        return f"ERROR: update failed — HTTP {put_r.status_code}"
+
+    @mcp.tool()
+    async def delete_food(food_name: str) -> str:
+        """
+        Delete a food entry by name.
+
+        Use this to surgically remove junk entries — things like "Fried",
+        "Extra-Virgin", or "Garnishes" that aren't real food entities and
+        pollute autocomplete. The food is matched case-insensitively.
+
+        Note: deleting a food that is still referenced by recipe ingredients
+        will leave those ingredients without a food link. Prefer merge_foods
+        when there is a canonical entry to redirect references to.
+
+        Args:
+            food_name: Name of the food to delete (case-insensitive).
+
+        Returns:
+            Success message or error description.
+        """
+        foods = await get_all(client, "/api/foods")
+        food = _find_food(foods, food_name)
+        if food is None:
+            return f"ERROR: food '{food_name}' not found"
+
+        ok = await _delete(client, "/api/foods", food["id"])
+        if ok:
+            return f"Deleted food '{food['name']}' ({food['id'][:8]}…)"
+        return "ERROR: delete failed — check Mealie logs"
+
+    @mcp.tool()
+    async def list_unlabeled_foods() -> str:
+        """
+        Return all foods that have no label assigned (labelId is null).
+
+        Use this as a diagnostic after a bulk assign_food_labels pass to see
+        what still needs labeling, without having to scan the full food list.
+
+        Returns:
+            Plain-text list of unlabeled food names sorted alphabetically, with
+            a count summary. Returns a "none found" message if all foods are labeled.
+        """
+        foods = await get_all(client, "/api/foods")
+        unlabeled = sorted(
+            (f["name"] for f in foods if not f.get("labelId")),
+            key=str.casefold,
+        )
+        if not unlabeled:
+            return f"All {len(foods)} food(s) have a label assigned."
+        lines = [
+            f"=== Unlabeled Foods ({len(unlabeled)} of {len(foods)}) ===",
+            "",
+        ]
+        lines.extend(f"  {name}" for name in unlabeled)
+        lines += ["", f"=== {len(unlabeled)} unlabeled ==="]
+        return "\n".join(lines)
+
+    @mcp.tool()
     async def get_ingredient_normalization_report() -> str:
         """
         Scan all recipes and report foods that appear with more than one distinct

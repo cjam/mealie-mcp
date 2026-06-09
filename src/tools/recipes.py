@@ -9,6 +9,7 @@ import httpx
 
 from utils import (
     cleanup_recipe_impl,
+    detect_unit_in_text,
     get_all,
     get_recipe,
     put_recipe,
@@ -112,11 +113,15 @@ def register_recipe_tools(mcp: Any, client: httpx.AsyncClient) -> None:
         """
         Scan all recipes and report which ones need ingredient cleanup or step linking.
 
-        Three categories are returned, in priority order:
+        Four categories are returned, in priority order:
           needs_cleanup — has at least one ingredient with no resolved food ID.
               Run cleanup_recipe on these first.
-          needs_linking — all food IDs resolved, has steps, but zero ingredient
-              references exist across all steps (linking has never been done).
+          needs_unit_cleanup — all food IDs resolved, but at least one ingredient
+              has no unit while its originalText contains a recognised unit word
+              (e.g. "2 cups flour" where unit is null). Use fix_ingredient or
+              enrich_recipe with ingredient_fixes to correct these.
+          needs_linking — all food/unit IDs resolved, has steps, but zero
+              ingredient references exist across all steps (linking never done).
               Run link_recipe_steps on these next.
           incomplete_linking — some references exist, but not every ingredient
               referenceId is covered by at least one step. Partial linking done;
@@ -128,12 +133,13 @@ def register_recipe_tools(mcp: Any, client: httpx.AsyncClient) -> None:
         collections.
 
         Returns:
-            Plain-text report listing slug and name for each recipe in all three
+            Plain-text report listing slug and name for each recipe in all four
             categories, with a summary line.
         """
         summaries = await get_all(client, "/api/recipes")
 
         needs_cleanup: list[dict] = []
+        needs_unit_cleanup: list[dict] = []
         needs_linking: list[dict] = []
         incomplete_linking: list[dict] = []
         skipped = 0
@@ -162,6 +168,25 @@ def register_recipe_tools(mcp: Any, client: httpx.AsyncClient) -> None:
 
             if has_unresolved:
                 needs_cleanup.append({"slug": slug, "name": name})
+                continue
+
+            # Ingredients where food is resolved but unit is null despite originalText
+            # containing a recognisable unit word ("2 cups flour" → unit should be cup).
+            unit_offenders: list[dict] = []
+            for ing in ingredients:
+                if (ing.get("food") or {}).get("id") and not (ing.get("unit") or {}).get("id"):
+                    original = (ing.get("originalText") or "").strip()
+                    detected = detect_unit_in_text(original) if original else None
+                    if detected:
+                        unit_offenders.append({
+                            "ref_id": ing.get("referenceId", "?"),
+                            "food_name": (ing.get("food") or {}).get("name", "?"),
+                            "unit_hint": detected,
+                            "original": original,
+                        })
+
+            if unit_offenders:
+                needs_unit_cleanup.append({"slug": slug, "name": name, "offenders": unit_offenders})
                 continue
 
             steps: list[dict] = recipe.get("recipeInstructions") or []
@@ -196,6 +221,19 @@ def register_recipe_tools(mcp: Any, client: httpx.AsyncClient) -> None:
             lines.append("  (none)")
 
         lines += [""]
+        lines.append(f"## Needs Unit Cleanup ({len(needs_unit_cleanup)} recipes)")
+        for r in needs_unit_cleanup:
+            lines.append(f"  {r['name']}  (slug: {r['slug']})")
+            for off in r["offenders"]:
+                lines.append(
+                    f"    [{off['ref_id']}]  \"{off['original']}\""
+                    f"  →  fix_ingredient('{r['slug']}', reference_id='{off['ref_id']}',"
+                    f" food_name='{off['food_name']}', unit_name='{off['unit_hint']}')"
+                )
+        if not needs_unit_cleanup:
+            lines.append("  (none)")
+
+        lines += [""]
         lines.append(f"## Needs Step Linking ({len(needs_linking)} recipes)")
         for r in needs_linking:
             lines.append(f"  {r['name']}  →  link_recipe_steps('{r['slug']}', {{step_id: [ref_ids], ...}})")
@@ -213,6 +251,7 @@ def register_recipe_tools(mcp: Any, client: httpx.AsyncClient) -> None:
         scanned = len(summaries) - skipped
         summary_line = (
             f"=== {scanned} recipes scanned · {len(needs_cleanup)} need cleanup · "
+            f"{len(needs_unit_cleanup)} need unit cleanup · "
             f"{len(needs_linking)} need linking · {len(incomplete_linking)} incomplete"
             + (f" · {skipped} skipped (fetch error)" if skipped else "")
             + " ==="

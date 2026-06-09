@@ -82,6 +82,25 @@ def _linked_ingredient(food: dict, unit: dict, quantity: float = 1.0, ref_id: st
     }
 
 
+def _food_linked_no_unit_ingredient(
+    food: dict,
+    original_text: str,
+    quantity: float = 1.0,
+    ref_id: str | None = None,
+) -> dict:
+    """Build an ingredient with food linked but no unit, with originalText set."""
+    return {
+        "referenceId": ref_id or str(uuid.uuid4()),
+        "food": food,
+        "unit": None,
+        "quantity": quantity,
+        "note": "",
+        "display": original_text,
+        "title": None,
+        "originalText": original_text,
+    }
+
+
 async def _food_ids_by_name(client: httpx.AsyncClient, name: str) -> list[str]:
     r = await client.get("/api/foods", params={"perPage": 200})
     r.raise_for_status()
@@ -486,6 +505,57 @@ async def test_get_recipes_needing_cleanup_surfaces_incomplete_linking(mealie_ht
         await _delete_recipe(mealie_http, slug)
         await _purge_foods(mealie_http, "xyzzy_incomplete_food_a", "xyzzy_incomplete_food_b")
         await _purge_units(mealie_http, "xyzzy_incomplete_unit")
+
+
+async def test_get_recipes_needing_cleanup_surfaces_missing_unit(mealie_http, mcp_server):
+    """A recipe where food is resolved but unit is null (with unit word in originalText) appears under needs_unit_cleanup."""
+    r = await mealie_http.post("/api/foods", json={"name": "xyzzy_unit_check_food"})
+    food = r.json()
+    slug = await _create_recipe(mealie_http, "NeedsCleanup: Missing Unit")
+    try:
+        await _set_ingredients(
+            mealie_http, slug,
+            [_food_linked_no_unit_ingredient(food, "2 cups xyzzy_unit_check_food")],
+        )
+
+        async with Client(mcp_server) as mcp:
+            result = await mcp.call_tool("get_recipes_needing_cleanup", {})
+
+        report = result.content[0].text
+        assert "## Needs Unit Cleanup" in report, f"Missing unit cleanup section:\n{report}"
+        unit_section = report.split("## Needs Unit Cleanup")[1].split("##")[0]
+        assert slug in unit_section, f"Slug not in unit cleanup section:\n{report}"
+        assert "cup" in unit_section, f"Detected unit 'cup' not shown:\n{report}"
+        assert "fix_ingredient" in unit_section, f"fix_ingredient call not shown:\n{report}"
+        # Must not bleed into the ingredient cleanup category
+        food_section = report.split("## Needs Ingredient Cleanup")[1].split("## Needs Unit Cleanup")[0]
+        assert slug not in food_section, f"Slug incorrectly in food cleanup section:\n{report}"
+    finally:
+        await _delete_recipe(mealie_http, slug)
+        await _purge_foods(mealie_http, "xyzzy_unit_check_food")
+
+
+async def test_get_recipes_needing_cleanup_skips_unit_less_ingredients(mealie_http, mcp_server):
+    """An ingredient like '2 eggs' (no unit word in originalText) is not flagged for unit cleanup."""
+    r = await mealie_http.post("/api/foods", json={"name": "xyzzy_no_unit_food"})
+    food = r.json()
+    slug = await _create_recipe(mealie_http, "NeedsCleanup: No Unit Needed")
+    try:
+        # "2 xyzzy_no_unit_food" has no unit indicator — it's a countable item
+        await _set_ingredients(
+            mealie_http, slug,
+            [_food_linked_no_unit_ingredient(food, "2 xyzzy_no_unit_food")],
+        )
+
+        async with Client(mcp_server) as mcp:
+            result = await mcp.call_tool("get_recipes_needing_cleanup", {})
+
+        report = result.content[0].text
+        unit_section = report.split("## Needs Unit Cleanup")[1].split("##")[0]
+        assert slug not in unit_section, f"Countable ingredient should not be flagged for unit cleanup:\n{report}"
+    finally:
+        await _delete_recipe(mealie_http, slug)
+        await _purge_foods(mealie_http, "xyzzy_no_unit_food")
 
 
 async def test_get_recipes_needing_cleanup_skips_empty_recipes(mealie_http, mcp_server):

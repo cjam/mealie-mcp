@@ -39,24 +39,9 @@ def register_shopping_tools(mcp: Any, client: httpx.AsyncClient) -> None:
             appear in different units across the added recipes (e.g. garlic in
             teaspoons from one recipe and tablespoons from another).
         """
-        all_items: list[dict] = []
-        page = 1
-        while True:
-            resp = await client.get(
-                "/api/households/shopping/items",
-                params={"shoppingListId": list_id, "page": page, "perPage": 100},
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            batch = data.get("items", []) if isinstance(data, dict) else data
-            all_items.extend(batch)
-            total_pages = (
-                data.get("totalPages") or data.get("total_pages", 1)
-                if isinstance(data, dict) else 1
-            )
-            if page >= total_pages:
-                break
-            page += 1
+        resp = await client.get(f"/api/households/shopping/lists/{list_id}")
+        resp.raise_for_status()
+        all_items: list[dict] = resp.json().get("listItems") or []
 
         lines = [f"=== Replace Shopping List from Recipes (list: {list_id}) ===", ""]
 
@@ -66,7 +51,7 @@ def register_shopping_tools(mcp: Any, client: httpx.AsyncClient) -> None:
             del_resp = await client.request(
                 "DELETE",
                 "/api/households/shopping/items",
-                json={"ids": item_ids},
+                params={"ids": item_ids},
             )
             if del_resp.is_success:
                 deleted = len(item_ids)
@@ -122,25 +107,10 @@ def register_shopping_tools(mcp: Any, client: httpx.AsyncClient) -> None:
             followed by a "Needs manual review" section for items that cannot
             be merged automatically.
         """
-        # ── 1. Fetch all items ────────────────────────────────────────────────
-        all_items: list[dict] = []
-        page = 1
-        while True:
-            resp = await client.get(
-                "/api/households/shopping/items",
-                params={"shoppingListId": list_id, "page": page, "perPage": 100},
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            batch = data.get("items", []) if isinstance(data, dict) else data
-            all_items.extend(batch)
-            total_pages = (
-                data.get("totalPages") or data.get("total_pages", 1)
-                if isinstance(data, dict) else 1
-            )
-            if page >= total_pages:
-                break
-            page += 1
+        # ── 1. Fetch items via list detail (the items endpoint has no list filter)
+        resp = await client.get(f"/api/households/shopping/lists/{list_id}")
+        resp.raise_for_status()
+        all_items: list[dict] = resp.json().get("listItems") or []
 
         lines = [
             f"=== Normalize Shopping List {'(DRY RUN)' if dry_run else '(LIVE)'} ===",
@@ -286,7 +256,7 @@ def register_shopping_tools(mcp: Any, client: httpx.AsyncClient) -> None:
 
             if to_delete:
                 r = await client.request(
-                    "DELETE", "/api/households/shopping/items", json={"ids": to_delete}
+                    "DELETE", "/api/households/shopping/items", params={"ids": to_delete}
                 )
                 if r.is_success:
                     deleted_count = len(to_delete)

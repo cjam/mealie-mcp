@@ -72,14 +72,46 @@ async def _add_item(
     return r.json()
 
 
-async def _list_items(client: httpx.AsyncClient, list_id: str) -> list[dict]:
-    r = await client.get(
-        "/api/households/shopping/items",
-        params={"shoppingListId": list_id, "perPage": 100},
-    )
+async def _add_item_bypassing_merge(
+    client: httpx.AsyncClient,
+    list_id: str,
+    food: dict,
+    unit: dict,
+    quantity: float,
+) -> dict:
+    """Add a shopping list item without triggering Mealie's insert-time auto-merge.
+
+    Mealie merges items that share a foodId when they are POSTed. Work around
+    this by inserting a text-only placeholder first, then PUTting the food/unit
+    onto the existing item, which does not trigger the merge logic.
+    """
+    r = await client.post("/api/households/shopping/items", json={
+        "shoppingListId": list_id, "quantity": quantity,
+        "note": "__placeholder__", "checked": False,
+    })
     r.raise_for_status()
     data = r.json()
-    return data.get("items", []) if isinstance(data, dict) else data
+    item = data["createdItems"][0] if "createdItems" in data else data
+    item_id = item["id"]
+
+    full_r = await client.get(f"/api/households/shopping/items/{item_id}")
+    full_r.raise_for_status()
+    full = full_r.json()
+    full["foodId"] = food["id"]
+    full["unitId"] = unit["id"]
+    full["food"] = food
+    full["unit"] = unit
+    full["quantity"] = quantity
+    full["note"] = ""
+    put_r = await client.put(f"/api/households/shopping/items/{item_id}", json=full)
+    put_r.raise_for_status()
+    return item
+
+
+async def _list_items(client: httpx.AsyncClient, list_id: str) -> list[dict]:
+    r = await client.get(f"/api/households/shopping/lists/{list_id}")
+    r.raise_for_status()
+    return r.json().get("listItems") or []
 
 
 # ── Tests ─────────────────────────────────────────────────────────────────────
@@ -94,13 +126,15 @@ async def test_normalize_shopping_list_registered(mcp_server):
 async def test_normalize_merges_same_unit_family(mcp_server, mealie_http):
     """3 tsp + 1 tbsp of the same food collapses to a single item."""
     food = await _get_or_create_food(mealie_http, "Test Garlic Normalize")
-    tsp = await _get_or_create_unit(mealie_http, "teaspoon", "tsp")
-    tbsp = await _get_or_create_unit(mealie_http, "tablespoon", "tbsp")
+    # Use alias names ("t", "tb") so Mealie doesn't set standardUnit and
+    # won't auto-merge items on insert or update.
+    tsp = await _get_or_create_unit(mealie_http, "t", "")
+    tbsp = await _get_or_create_unit(mealie_http, "tb", "")
     list_id = await _create_shopping_list(mealie_http, "Test Normalize Merge")
 
     try:
-        await _add_item(mealie_http, list_id, food, tsp, 3.0)   # 3 tsp = 1 tbsp
-        await _add_item(mealie_http, list_id, food, tbsp, 1.0)  # 1 tbsp
+        await _add_item_bypassing_merge(mealie_http, list_id, food, tsp, 3.0)
+        await _add_item_bypassing_merge(mealie_http, list_id, food, tbsp, 1.0)
 
         assert len(await _list_items(mealie_http, list_id)) == 2
 
@@ -124,13 +158,13 @@ async def test_normalize_merges_same_unit_family(mcp_server, mealie_http):
 async def test_normalize_dry_run_no_changes(mcp_server, mealie_http):
     """dry_run=True reports the merge plan but does not write anything."""
     food = await _get_or_create_food(mealie_http, "Test Onion DryRun")
-    tsp = await _get_or_create_unit(mealie_http, "teaspoon", "tsp")
-    tbsp = await _get_or_create_unit(mealie_http, "tablespoon", "tbsp")
+    tsp = await _get_or_create_unit(mealie_http, "t", "")
+    tbsp = await _get_or_create_unit(mealie_http, "tb", "")
     list_id = await _create_shopping_list(mealie_http, "Test Normalize DryRun")
 
     try:
-        await _add_item(mealie_http, list_id, food, tsp, 6.0)
-        await _add_item(mealie_http, list_id, food, tbsp, 2.0)
+        await _add_item_bypassing_merge(mealie_http, list_id, food, tsp, 6.0)
+        await _add_item_bypassing_merge(mealie_http, list_id, food, tbsp, 2.0)
 
         async with Client(mcp_server) as mcp:
             result = await mcp.call_tool(
@@ -142,7 +176,7 @@ async def test_normalize_dry_run_no_changes(mcp_server, mealie_http):
         assert "MERGE" in text
         assert "dry run" in text.lower()
 
-        # Items must be unchanged.
+        # Items must be unchanged after a dry run.
         assert len(await _list_items(mealie_http, list_id)) == 2
 
     finally:
@@ -152,13 +186,15 @@ async def test_normalize_dry_run_no_changes(mcp_server, mealie_http):
 async def test_normalize_skips_incompatible_families(mcp_server, mealie_http):
     """Items in different unit families for the same food are left alone."""
     food = await _get_or_create_food(mealie_http, "Test Chicken Incompat")
-    oz = await _get_or_create_unit(mealie_http, "ounce", "oz")    # imperial_weight
-    cup = await _get_or_create_unit(mealie_http, "cup", "c")      # us_volume
+    # "lbs" → pound (imperial_weight), "t" → teaspoon (us_volume).
+    # Both aliases give standardUnit=None so Mealie won't auto-merge them.
+    lbs = await _get_or_create_unit(mealie_http, "lbs", "")   # imperial_weight
+    tsp = await _get_or_create_unit(mealie_http, "t", "")     # us_volume
     list_id = await _create_shopping_list(mealie_http, "Test Normalize Incompat")
 
     try:
-        await _add_item(mealie_http, list_id, food, oz, 4.0)
-        await _add_item(mealie_http, list_id, food, cup, 1.0)
+        await _add_item_bypassing_merge(mealie_http, list_id, food, lbs, 4.0)
+        await _add_item_bypassing_merge(mealie_http, list_id, food, tsp, 1.0)
 
         async with Client(mcp_server) as mcp:
             result = await mcp.call_tool("normalize_shopping_list", {"list_id": list_id})
