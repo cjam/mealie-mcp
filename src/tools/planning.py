@@ -7,6 +7,8 @@ from typing import Any
 
 import httpx
 
+from utils import resolve_recipe_id
+
 
 async def _get_mealplans_range(
     client: httpx.AsyncClient, start_date: str, end_date: str
@@ -67,7 +69,7 @@ def register_planning_tools(mcp: Any, client: httpx.AsyncClient) -> None:
                         this day through the following 6 days.
             entries:    List of dicts, each with:
                           date       (str, YYYY-MM-DD, required)
-                          recipe_id  (str, Mealie recipe UUID, required)
+                          recipe_id  (str, Mealie recipe UUID or slug, required)
                           entry_type (str, optional — "breakfast"/"lunch"/"dinner"/
                                       "side", defaults to "dinner")
                           title      (str, optional — shown when recipe_id absent)
@@ -94,10 +96,17 @@ def register_planning_tools(mcp: Any, client: httpx.AsyncClient) -> None:
 
         created = 0
         for entry in entries:
+            recipe_id = entry.get("recipe_id")
+            if recipe_id:
+                try:
+                    recipe_id = await resolve_recipe_id(client, recipe_id)
+                except Exception:
+                    lines.append(f"  WARN: could not resolve recipe '{recipe_id}' — skipping")
+                    continue
             payload = {
                 "date": entry["date"],
                 "entryType": entry.get("entry_type", "dinner"),
-                "recipeId": entry.get("recipe_id"),
+                "recipeId": recipe_id,
                 "title": entry.get("title", ""),
             }
             r = await client.post("/api/households/mealplans", json=payload)

@@ -210,6 +210,53 @@ async def test_normalize_skips_incompatible_families(mcp_server, mealie_http):
         await _delete_shopping_list(mealie_http, list_id)
 
 
+async def _create_recipe(client, name: str) -> dict:
+    r = await client.post("/api/recipes", json={"name": name})
+    r.raise_for_status()
+    slug = r.json()
+    r2 = await client.get(f"/api/recipes/{slug}")
+    r2.raise_for_status()
+    return r2.json()
+
+
+async def _delete_recipe(client, slug: str) -> None:
+    await client.delete(f"/api/recipes/{slug}")
+
+
+async def test_replace_shopping_list_accepts_slug(mcp_server, mealie_http):
+    """replace_shopping_list_from_recipes resolves slugs to UUIDs without error."""
+    recipe = await _create_recipe(mealie_http, "Test Slug Resolution Recipe")
+    list_id = await _create_shopping_list(mealie_http, "Test Slug List")
+    try:
+        async with Client(mcp_server) as mcp:
+            result = await mcp.call_tool(
+                "replace_shopping_list_from_recipes",
+                {"list_id": list_id, "recipe_ids": [recipe["slug"]]},
+            )
+        text = result.content[0].text
+        assert "could not resolve recipe" not in text
+        assert "Added 1/1" in text
+    finally:
+        await _delete_recipe(mealie_http, recipe["slug"])
+        await _delete_shopping_list(mealie_http, list_id)
+
+
+async def test_replace_shopping_list_warns_on_missing_slug(mcp_server, mealie_http):
+    """replace_shopping_list_from_recipes warns and skips an unresolvable slug."""
+    list_id = await _create_shopping_list(mealie_http, "Test Bad Slug List")
+    try:
+        async with Client(mcp_server) as mcp:
+            result = await mcp.call_tool(
+                "replace_shopping_list_from_recipes",
+                {"list_id": list_id, "recipe_ids": ["no-such-recipe-slug"]},
+            )
+        text = result.content[0].text
+        assert "could not resolve recipe" in text
+        assert "Added 0/1" in text
+    finally:
+        await _delete_shopping_list(mealie_http, list_id)
+
+
 async def test_normalize_single_item_foods_untouched(mcp_server, mealie_http):
     """Foods with only one item on the list are never touched."""
     food = await _get_or_create_food(mealie_http, "Test Carrot Untouched")

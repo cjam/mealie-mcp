@@ -790,11 +790,9 @@ async def test_fix_ingredient_links_sub_recipe(mealie_http, mcp_server):
         recipe.raise_for_status()
         recipe_data = recipe.json()
         ing = next(i for i in recipe_data["recipeIngredient"] if i.get("referenceId") == ref_id)
-        # Verify the sub-recipe reference was stored under recipeIngredient on the ingredient.
-        # If this assertion fails, print ing so the correct field name can be identified.
-        sub_ref = ing.get("recipeIngredient")
+        sub_ref = ing.get("referencedRecipe")
         assert sub_ref is not None, (
-            f"recipeIngredient not set on ingredient after fix — actual ingredient fields: {list(ing.keys())}\nFull ingredient: {ing}"
+            f"referencedRecipe not set on ingredient after fix — actual fields: {list(ing.keys())}\nFull ingredient: {ing}"
         )
         assert sub_ref.get("id") == sub_recipe_id, (
             f"Wrong recipe linked: expected id={sub_recipe_id}, got {sub_ref}"
@@ -1122,9 +1120,9 @@ async def test_enrich_recipe_ingredient_fix_links_sub_recipe(mealie_http, mcp_se
 
         recipe = await _get_recipe(mealie_http, parent_slug)
         ing = next(i for i in recipe["recipeIngredient"] if i.get("referenceId") == ref_id)
-        sub_ref = ing.get("recipeIngredient")
+        sub_ref = ing.get("referencedRecipe")
         assert sub_ref is not None, (
-            f"recipeIngredient not set after enrich — actual fields: {list(ing.keys())}\nFull ingredient: {ing}"
+            f"referencedRecipe not set after enrich — actual fields: {list(ing.keys())}\nFull ingredient: {ing}"
         )
         assert sub_ref.get("id") == sub_recipe_id, (
             f"Wrong recipe linked: expected id={sub_recipe_id}, got {sub_ref}"

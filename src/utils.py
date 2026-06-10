@@ -255,6 +255,12 @@ async def get_recipe(client: httpx.AsyncClient, slug: str) -> dict:
     return resp.json()
 
 
+async def resolve_recipe_id(client: httpx.AsyncClient, slug_or_id: str) -> str:
+    """Return the UUID for a recipe given its slug or UUID."""
+    recipe = await get_recipe(client, slug_or_id)
+    return recipe["id"]
+
+
 async def put_recipe(client: httpx.AsyncClient, slug: str, recipe: dict) -> bool:
     try:
         r = await client.put(f"/api/recipes/{slug}", json=recipe)

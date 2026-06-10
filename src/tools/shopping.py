@@ -6,7 +6,7 @@ from typing import Any
 
 import httpx
 
-from utils import normalize_unit, unit_family_and_factor
+from utils import normalize_unit, resolve_recipe_id, unit_family_and_factor
 
 
 def register_shopping_tools(mcp: Any, client: httpx.AsyncClient) -> None:
@@ -29,7 +29,7 @@ def register_shopping_tools(mcp: Any, client: httpx.AsyncClient) -> None:
 
         Args:
             list_id:    UUID of the shopping list to replace.
-            recipe_ids: Ordered list of recipe UUIDs whose ingredients to add.
+            recipe_ids: Ordered list of recipe UUIDs or slugs whose ingredients to add.
             scale:      Serving multiplier applied to every recipe (default 1.0).
 
         Returns:
@@ -63,7 +63,12 @@ def register_shopping_tools(mcp: Any, client: httpx.AsyncClient) -> None:
 
         added = 0
         params = {"recipeIncrements": scale} if scale != 1.0 else {}
-        for recipe_id in recipe_ids:
+        for slug_or_id in recipe_ids:
+            try:
+                recipe_id = await resolve_recipe_id(client, slug_or_id)
+            except Exception:
+                lines.append(f"  WARN: could not resolve recipe '{slug_or_id}' — skipping")
+                continue
             r = await client.post(
                 f"/api/households/shopping/lists/{list_id}/recipe/{recipe_id}",
                 params=params or None,
@@ -71,7 +76,7 @@ def register_shopping_tools(mcp: Any, client: httpx.AsyncClient) -> None:
             if r.is_success:
                 added += 1
             else:
-                lines.append(f"  WARN: add recipe {recipe_id} failed — HTTP {r.status_code}")
+                lines.append(f"  WARN: add recipe {slug_or_id} failed — HTTP {r.status_code}")
         lines.append(f"  Added {added}/{len(recipe_ids)} recipes")
         lines.append("\n=== Done ===")
         return "\n".join(lines)

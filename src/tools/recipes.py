@@ -320,13 +320,13 @@ def register_recipe_tools(mcp: Any, client: httpx.AsyncClient) -> None:
                 ref_recipe = await get_recipe(client, reference_recipe_slug)
             except Exception as exc:
                 return f"ERROR: could not fetch reference recipe '{reference_recipe_slug}': {exc}"
-            target["recipeIngredient"] = {
+            target["referencedRecipe"] = {
                 "id": ref_recipe["id"],
                 "name": ref_recipe["name"],
                 "slug": ref_recipe.get("slug", reference_recipe_slug),
             }
             target["food"] = None
-            lines.append(f"  recipeIngredient: '{ref_recipe.get('name', reference_recipe_slug)}' [linked]")
+            lines.append(f"  referencedRecipe: '{ref_recipe.get('name', reference_recipe_slug)}' [linked]")
         else:
             foods = await get_all(client, "/api/foods")
             units = await get_all(client, "/api/units")
@@ -838,7 +838,7 @@ def register_recipe_tools(mcp: Any, client: httpx.AsyncClient) -> None:
                 if ref_recipe_slug_fix:
                     try:
                         ref_recipe = await get_recipe(client, ref_recipe_slug_fix)
-                        ing["recipeIngredient"] = {
+                        ing["referencedRecipe"] = {
                             "id": ref_recipe["id"],
                             "name": ref_recipe["name"],
                             "slug": ref_recipe.get("slug", ref_recipe_slug_fix),
