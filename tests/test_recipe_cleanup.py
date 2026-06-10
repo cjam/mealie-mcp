@@ -740,6 +740,70 @@ async def test_fix_ingredient_returns_error_for_unknown_recipe(mcp_server):
     assert "error" in report.lower(), f"Expected error for unknown recipe:\n{report}"
 
 
+async def test_fix_ingredient_requires_food_or_reference_recipe(mealie_http, mcp_server):
+    """fix_ingredient returns an error when neither food_name nor reference_recipe_slug is given."""
+    ref_id = str(uuid.uuid4())
+    slug = await _create_recipe(mealie_http, "FixIngredient: No Food Or Ref")
+    try:
+        await _set_ingredients(mealie_http, slug, [_note_ingredient("raw text", ref_id=ref_id)])
+
+        async with Client(mcp_server) as mcp:
+            result = await mcp.call_tool(
+                "fix_ingredient",
+                {"recipe_slug": slug, "reference_id": ref_id},
+            )
+
+        report = result.content[0].text
+        assert "error" in report.lower(), f"Expected error when no food_name or reference_recipe_slug:\n{report}"
+    finally:
+        await _delete_recipe(mealie_http, slug)
+
+
+async def test_fix_ingredient_links_sub_recipe(mealie_http, mcp_server):
+    """fix_ingredient with reference_recipe_slug sets recipeIngredient on the ingredient."""
+    parent_slug = await _create_recipe(mealie_http, "FixIngredient: Parent Recipe")
+    sub_slug = await _create_recipe(mealie_http, "FixIngredient: Sub Recipe")
+    try:
+        sub_recipe = await mealie_http.get(f"/api/recipes/{sub_slug}")
+        sub_recipe.raise_for_status()
+        sub_recipe_id = sub_recipe.json()["id"]
+
+        ref_id = str(uuid.uuid4())
+        await _set_ingredients(mealie_http, parent_slug, [_note_ingredient("sauce", ref_id=ref_id)])
+
+        async with Client(mcp_server) as mcp:
+            result = await mcp.call_tool(
+                "fix_ingredient",
+                {
+                    "recipe_slug": parent_slug,
+                    "reference_id": ref_id,
+                    "reference_recipe_slug": sub_slug,
+                },
+            )
+
+        report = result.content[0].text
+        assert "error" not in report.lower(), f"Unexpected error:\n{report}"
+        assert "patch ok" in report.lower(), f"Expected PATCH OK:\n{report}"
+        assert "linked" in report.lower(), f"Expected 'linked' in:\n{report}"
+
+        recipe = await mealie_http.get(f"/api/recipes/{parent_slug}")
+        recipe.raise_for_status()
+        recipe_data = recipe.json()
+        ing = next(i for i in recipe_data["recipeIngredient"] if i.get("referenceId") == ref_id)
+        # Verify the sub-recipe reference was stored under recipeIngredient on the ingredient.
+        # If this assertion fails, print ing so the correct field name can be identified.
+        sub_ref = ing.get("recipeIngredient")
+        assert sub_ref is not None, (
+            f"recipeIngredient not set on ingredient after fix — actual ingredient fields: {list(ing.keys())}\nFull ingredient: {ing}"
+        )
+        assert sub_ref.get("id") == sub_recipe_id, (
+            f"Wrong recipe linked: expected id={sub_recipe_id}, got {sub_ref}"
+        )
+    finally:
+        await _delete_recipe(mealie_http, parent_slug)
+        await _delete_recipe(mealie_http, sub_slug)
+
+
 # ── Tests: create_recipe ──────────────────────────────────────────────────────
 
 
@@ -1028,3 +1092,43 @@ async def test_enrich_recipe_applies_all_in_single_put(mealie_http, mcp_server):
         await _delete_recipe(mealie_http, slug)
         await _purge_foods(mealie_http, food_name)
         await _purge_units(mealie_http, "enrich_all_unit")
+
+
+async def test_enrich_recipe_ingredient_fix_links_sub_recipe(mealie_http, mcp_server):
+    """enrich_recipe ingredient_fixes with reference_recipe_slug sets sub-recipe on the ingredient."""
+    parent_slug = await _create_recipe(mealie_http, "Enrich: Sub Recipe Parent")
+    sub_slug = await _create_recipe(mealie_http, "Enrich: Sub Recipe Child")
+    try:
+        sub_r = await mealie_http.get(f"/api/recipes/{sub_slug}")
+        sub_r.raise_for_status()
+        sub_recipe_id = sub_r.json()["id"]
+
+        ref_id = str(uuid.uuid4())
+        await _set_ingredients(mealie_http, parent_slug, [_note_ingredient("sauce", ref_id=ref_id)])
+
+        async with Client(mcp_server) as mcp:
+            result = await mcp.call_tool(
+                "enrich_recipe",
+                {
+                    "recipe_slug": parent_slug,
+                    "ingredient_fixes": [
+                        {"reference_id": ref_id, "reference_recipe_slug": sub_slug},
+                    ],
+                },
+            )
+        report = result.content[0].text
+        assert "put ok" in report.lower(), f"Expected PUT OK:\n{report}"
+        assert "linked" in report.lower(), f"Expected 'linked' in:\n{report}"
+
+        recipe = await _get_recipe(mealie_http, parent_slug)
+        ing = next(i for i in recipe["recipeIngredient"] if i.get("referenceId") == ref_id)
+        sub_ref = ing.get("recipeIngredient")
+        assert sub_ref is not None, (
+            f"recipeIngredient not set after enrich — actual fields: {list(ing.keys())}\nFull ingredient: {ing}"
+        )
+        assert sub_ref.get("id") == sub_recipe_id, (
+            f"Wrong recipe linked: expected id={sub_recipe_id}, got {sub_ref}"
+        )
+    finally:
+        await _delete_recipe(mealie_http, parent_slug)
+        await _delete_recipe(mealie_http, sub_slug)

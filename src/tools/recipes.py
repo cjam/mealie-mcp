@@ -263,10 +263,11 @@ def register_recipe_tools(mcp: Any, client: httpx.AsyncClient) -> None:
     async def fix_ingredient(
         recipe_slug: str,
         reference_id: str,
-        food_name: str,
+        food_name: str = "",
         unit_name: str = "",
         quantity: float | None = None,
         note: str = "",
+        reference_recipe_slug: str = "",
     ) -> str:
         """
         Surgically fix a single ingredient on a recipe without touching the rest.
@@ -276,17 +277,30 @@ def register_recipe_tools(mcp: Any, client: httpx.AsyncClient) -> None:
         (or creates) the food and optional unit in the Mealie database, applies
         any quantity/note override, then PUTs the recipe back.
 
+        To link the ingredient to another recipe (sub-recipe), pass
+        reference_recipe_slug instead of food_name. Mealie will store the
+        referenced recipe in the ingredient's recipeIngredient field and clear
+        the food field. Provide food_name OR reference_recipe_slug, not both.
+
         Args:
-            recipe_slug:  The recipe slug or ID.
-            reference_id: The ingredient's referenceId (shown in cleanup_recipe output).
-            food_name:    Corrected food name. Looked up or created in the food DB.
-            unit_name:    Corrected unit name (optional). Looked up or created.
-            quantity:     Corrected quantity (optional). Leave None to keep existing.
-            note:         Corrected note/display text (optional). Leave empty to keep existing.
+            recipe_slug:           The recipe slug or ID.
+            reference_id:          The ingredient's referenceId (shown in cleanup_recipe output).
+            food_name:             Corrected food name. Looked up or created in the food DB.
+                                   Omit when using reference_recipe_slug.
+            unit_name:             Corrected unit name (optional). Looked up or created.
+            quantity:              Corrected quantity (optional). Leave None to keep existing.
+            note:                  Corrected note/display text (optional). Leave empty to keep existing.
+            reference_recipe_slug: Link this ingredient to another recipe as a sub-recipe.
+                                   The ingredient's food is cleared and its recipeIngredient
+                                   field is set to the referenced recipe. Use food_name OR
+                                   reference_recipe_slug, not both.
 
         Returns:
             Plain-text summary of what changed and whether the PATCH succeeded.
         """
+        if not food_name and not reference_recipe_slug:
+            return "ERROR: provide either food_name (food ingredient) or reference_recipe_slug (sub-recipe link)"
+
         try:
             recipe = await get_recipe(client, recipe_slug)
         except Exception as exc:
@@ -297,22 +311,45 @@ def register_recipe_tools(mcp: Any, client: httpx.AsyncClient) -> None:
         if target is None:
             return f"ERROR: no ingredient with referenceId '{reference_id}' in recipe '{recipe_slug}'"
 
-        foods = await get_all(client, "/api/foods")
-        units = await get_all(client, "/api/units")
-        food_map = {normalize_food(f["name"]): f for f in foods}
-        unit_map = {normalize_unit(u["name"]): u for u in units}
-
         lines: list[str] = [
             f"=== Fix Ingredient [{reference_id}] in '{recipe.get('name', recipe_slug)}' ===", ""
         ]
 
-        food, action = await find_or_create_food(client, food_name, food_map)
-        if food is None:
-            return f"ERROR: could not find or create food '{food_name}'"
-        target["food"] = food
-        lines.append(f"  food: '{food['name']}' [{action}]")
+        if reference_recipe_slug:
+            try:
+                ref_recipe = await get_recipe(client, reference_recipe_slug)
+            except Exception as exc:
+                return f"ERROR: could not fetch reference recipe '{reference_recipe_slug}': {exc}"
+            target["recipeIngredient"] = {
+                "id": ref_recipe["id"],
+                "name": ref_recipe["name"],
+                "slug": ref_recipe.get("slug", reference_recipe_slug),
+            }
+            target["food"] = None
+            lines.append(f"  recipeIngredient: '{ref_recipe.get('name', reference_recipe_slug)}' [linked]")
+        else:
+            foods = await get_all(client, "/api/foods")
+            units = await get_all(client, "/api/units")
+            food_map = {normalize_food(f["name"]): f for f in foods}
+            unit_map = {normalize_unit(u["name"]): u for u in units}
 
-        if unit_name:
+            food, action = await find_or_create_food(client, food_name, food_map)
+            if food is None:
+                return f"ERROR: could not find or create food '{food_name}'"
+            target["food"] = food
+            lines.append(f"  food: '{food['name']}' [{action}]")
+
+            if unit_name:
+                unit, u_action = await find_or_create_unit(client, unit_name, unit_map)
+                if unit is None:
+                    lines.append(f"  WARN: could not find or create unit '{unit_name}' — unit left unchanged")
+                else:
+                    target["unit"] = unit
+                    lines.append(f"  unit: '{unit['name']}' [{u_action}]")
+
+        if unit_name and reference_recipe_slug:
+            units = await get_all(client, "/api/units")
+            unit_map = {normalize_unit(u["name"]): u for u in units}
             unit, u_action = await find_or_create_unit(client, unit_name, unit_map)
             if unit is None:
                 lines.append(f"  WARN: could not find or create unit '{unit_name}' — unit left unchanged")
@@ -745,8 +782,10 @@ def register_recipe_tools(mcp: Any, client: httpx.AsyncClient) -> None:
                                  Pass [] to clear all categories.
             ingredient_fixes:    List of ingredient corrections. Each entry is a
                                  dict with keys: reference_id (required),
-                                 food_name (required), unit_name, quantity,
-                                 note (all optional).
+                                 food_name OR reference_recipe_slug (one required),
+                                 unit_name, quantity, note (all optional).
+                                 Use reference_recipe_slug to link the ingredient
+                                 to another recipe as a sub-recipe instead of a food.
 
         Returns:
             Plain-text summary of every change applied and the final PUT status.
@@ -783,9 +822,10 @@ def register_recipe_tools(mcp: Any, client: httpx.AsyncClient) -> None:
                 unit_name_fix = fix.get("unit_name") or fix.get("unitName", "")
                 quantity_fix = fix.get("quantity")
                 note_fix = fix.get("note", "")
+                ref_recipe_slug_fix = fix.get("reference_recipe_slug") or fix.get("referenceRecipeSlug", "")
 
-                if not ref_id or not food_name_fix:
-                    lines.append(f"  WARN: skipping fix missing reference_id or food_name: {fix}")
+                if not ref_id or (not food_name_fix and not ref_recipe_slug_fix):
+                    lines.append(f"  WARN: skipping fix missing reference_id or food_name/reference_recipe_slug: {fix}")
                     continue
 
                 ing = ing_by_ref.get(ref_id)
@@ -793,12 +833,28 @@ def register_recipe_tools(mcp: Any, client: httpx.AsyncClient) -> None:
                     lines.append(f"  WARN: no ingredient with referenceId '{ref_id}'")
                     continue
 
-                food, action = await find_or_create_food(client, food_name_fix, food_map)
-                if food is None:
-                    lines.append(f"  [{ref_id}] FAILED: could not find or create food '{food_name_fix}'")
-                    continue
-                ing["food"] = food
-                parts = [f"food '{food['name']}' [{action}]"]
+                parts: list[str] = []
+
+                if ref_recipe_slug_fix:
+                    try:
+                        ref_recipe = await get_recipe(client, ref_recipe_slug_fix)
+                        ing["recipeIngredient"] = {
+                            "id": ref_recipe["id"],
+                            "name": ref_recipe["name"],
+                            "slug": ref_recipe.get("slug", ref_recipe_slug_fix),
+                        }
+                        ing["food"] = None
+                        parts.append(f"sub-recipe '{ref_recipe.get('name', ref_recipe_slug_fix)}' [linked]")
+                    except Exception as exc:
+                        lines.append(f"  [{ref_id}] FAILED: could not fetch reference recipe '{ref_recipe_slug_fix}': {exc}")
+                        continue
+                else:
+                    food, action = await find_or_create_food(client, food_name_fix, food_map)
+                    if food is None:
+                        lines.append(f"  [{ref_id}] FAILED: could not find or create food '{food_name_fix}'")
+                        continue
+                    ing["food"] = food
+                    parts.append(f"food '{food['name']}' [{action}]")
 
                 if unit_name_fix:
                     unit, u_action = await find_or_create_unit(client, unit_name_fix, unit_map)
