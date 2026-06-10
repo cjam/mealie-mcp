@@ -49,6 +49,79 @@ def _find_unit(units: list[dict], query: str) -> dict | None:
     return None
 
 
+# ── Scan helpers (pure computation, no I/O) ───────────────────────────────────
+
+def _compute_food_changes(
+    foods: list[dict],
+) -> tuple[list[dict], list[dict]]:
+    """Compute food merges and renames from the current food list.
+
+    Returns:
+        merges: [{"from_id", "keep_id", "from_name", "canon"}, ...]
+        renames: [{"id", "old_name", "new_name"}, ...]
+    """
+    merges: list[dict] = []
+    renames: list[dict] = []
+
+    groups: dict[str, list[dict]] = {}
+    for food in foods:
+        groups.setdefault(normalize_food(food["name"]), []).append(food)
+
+    for key, group in sorted(groups.items()):
+        canon = canonical_food(key, [f["name"] for f in group])
+        if len(group) > 1:
+            keep = next((f for f in group if f["name"] == f["name"].title()), group[0])
+            for dup in group:
+                if dup["id"] == keep["id"]:
+                    continue
+                merges.append({"from_id": dup["id"], "keep_id": keep["id"], "from_name": dup["name"], "canon": canon})
+            if keep["name"] != canon:
+                renames.append({"id": keep["id"], "old_name": keep["name"], "new_name": canon})
+        else:
+            food = group[0]
+            if food["name"] != canon:
+                renames.append({"id": food["id"], "old_name": food["name"], "new_name": canon})
+
+    return merges, renames
+
+
+def _compute_unit_changes(
+    units: list[dict],
+) -> tuple[list[dict], list[dict], list[dict]]:
+    """Compute unit merges, renames, and missing standard units.
+
+    Returns:
+        merges: [{"from_id", "keep_id", "from_name", "canon"}, ...]
+        renames: [{"id", "old_name", "new_name"}, ...]
+        missing: subset of STANDARD_UNITS not yet present
+    """
+    merges: list[dict] = []
+    renames: list[dict] = []
+    existing_canonical: set[str] = set()
+
+    unit_groups: dict[str, list[dict]] = {}
+    for unit in units:
+        unit_groups.setdefault(normalize_unit(unit["name"]), []).append(unit)
+
+    for canon, group in sorted(unit_groups.items()):
+        existing_canonical.add(canon)
+        if len(group) > 1:
+            keep = next((u for u in group if u["name"].lower() == canon), group[0])
+            for dup in group:
+                if dup["id"] == keep["id"]:
+                    continue
+                merges.append({"from_id": dup["id"], "keep_id": keep["id"], "from_name": dup["name"], "canon": canon})
+            if keep["name"] != canon:
+                renames.append({"id": keep["id"], "old_name": keep["name"], "new_name": canon})
+        else:
+            unit = group[0]
+            if unit["name"] != canon:
+                renames.append({"id": unit["id"], "old_name": unit["name"], "new_name": canon})
+
+    missing = [u for u in STANDARD_UNITS if u["name"] not in existing_canonical]
+    return merges, renames, missing
+
+
 # ── Helpers used only by cleanup_system ───────────────────────────────────────
 
 async def _backup(client: httpx.AsyncClient) -> str:
@@ -152,53 +225,31 @@ def register_cleanup_tools(mcp: Any, client: httpx.AsyncClient) -> None:
             lines.append(f"  ERROR fetching foods: {exc}")
             foods = []
 
-        food_merges: list[tuple[str, str, str]] = []
-        food_renames: list[tuple[str, str, str]] = []
-
         if foods:
-            groups: dict[str, list[dict]] = {}
-            for food in foods:
-                groups.setdefault(normalize_food(food["name"]), []).append(food)
-
-            for key, group in sorted(groups.items()):
-                canon = canonical_food(key, [f["name"] for f in group])
-
-                if len(group) > 1:
-                    keep = next((f for f in group if f["name"] == f["name"].title()), group[0])
-                    for dup in group:
-                        if dup["id"] == keep["id"]:
-                            continue
-                        food_merges.append((dup["id"], keep["id"], canon))
-                        lines.append(f"  MERGE  '{dup['name']}' → '{canon}'")
-                    if keep["name"] != canon:
-                        food_renames.append((keep["id"], keep["name"], canon))
-                        lines.append(f"  RENAME '{keep['name']}' → '{canon}'")
-                else:
-                    food = group[0]
-                    if food["name"] != canon:
-                        food_renames.append((food["id"], food["name"], canon))
-                        lines.append(f"  RENAME '{food['name']}' → '{canon}'")
-
+            food_merges, food_renames = _compute_food_changes(foods)
+            for m in food_merges:
+                lines.append(f"  MERGE  '{m['from_name']}' → '{m['canon']}'")
+            for r in food_renames:
+                lines.append(f"  RENAME '{r['old_name']}' → '{r['new_name']}'")
             lines.append(
                 f"  Summary: {len(foods)} foods · "
                 f"{len(food_merges)} to merge · {len(food_renames)} to rename"
             )
-
             if not dry_run:
                 merged = renamed = 0
-                for item_id, old_name, canon in food_renames:
-                    if await _rename(client, "/api/foods", item_id, canon):
+                for r in food_renames:
+                    if await _rename(client, "/api/foods", r["id"], r["new_name"]):
                         renamed += 1
                     else:
-                        lines.append(f"  WARN: rename failed for '{old_name}'")
-                for dup_id, keep_id, canon in food_merges:
-                    ok = await _merge_foods(client, dup_id, keep_id)
+                        lines.append(f"  WARN: rename failed for '{r['old_name']}'")
+                for m in food_merges:
+                    ok = await _merge_foods(client, m["from_id"], m["keep_id"])
                     if not ok:
-                        ok = await _delete(client, "/api/foods", dup_id)
+                        ok = await _delete(client, "/api/foods", m["from_id"])
                     if ok:
                         merged += 1
                     else:
-                        lines.append(f"  WARN: merge/delete failed for food {dup_id[:8]}…")
+                        lines.append(f"  WARN: merge/delete failed for food {m['from_id'][:8]}…")
                 lines.append(f"  Applied: {merged} merged · {renamed} renamed")
         else:
             lines.append("  No foods found.")
@@ -212,73 +263,248 @@ def register_cleanup_tools(mcp: Any, client: httpx.AsyncClient) -> None:
             lines.append(f"  ERROR fetching units: {exc}")
             units = []
 
-        unit_merges: list[tuple[str, str, str]] = []
-        unit_renames: list[tuple[str, str, str]] = []
-        existing_canonical: set[str] = set()
+        if units is not None:
+            unit_merges, unit_renames, missing = _compute_unit_changes(units)
+            for m in unit_merges:
+                lines.append(f"  MERGE  '{m['from_name']}' → '{m['canon']}'")
+            for r in unit_renames:
+                lines.append(f"  RENAME '{r['old_name']}' → '{r['new_name']}'")
+            for u in missing:
+                abbr = f" (abbr: {u['abbreviation']})" if u["abbreviation"] else ""
+                lines.append(f"  ADD    '{u['name']}'{abbr}")
+            lines.append(
+                f"  Summary: {len(units)} units · "
+                f"{len(unit_merges)} to merge · {len(unit_renames)} to rename · "
+                f"{len(missing)} to add"
+            )
+            if not dry_run:
+                merged = renamed = added = 0
+                for r in unit_renames:
+                    if await _rename(client, "/api/units", r["id"], r["new_name"]):
+                        renamed += 1
+                    else:
+                        lines.append(f"  WARN: rename failed for '{r['old_name']}'")
+                for m in unit_merges:
+                    ok = await _merge_units(client, m["from_id"], m["keep_id"])
+                    if not ok:
+                        ok = await _delete(client, "/api/units", m["from_id"])
+                    if ok:
+                        merged += 1
+                    else:
+                        lines.append(f"  WARN: merge/delete failed for unit {m['from_id'][:8]}…")
+                for u in missing:
+                    payload = {
+                        "name": u["name"],
+                        "pluralName": u["pluralName"],
+                        "abbreviation": u["abbreviation"],
+                        "fraction": u["fraction"],
+                    }
+                    if await _create_unit(client, payload):
+                        added += 1
+                    else:
+                        lines.append(f"  WARN: failed to create unit '{u['name']}'")
+                lines.append(f"  Applied: {merged} merged · {renamed} renamed · {added} added")
+        lines.append("")
 
-        if units:
-            unit_groups: dict[str, list[dict]] = {}
-            for unit in units:
-                unit_groups.setdefault(normalize_unit(unit["name"]), []).append(unit)
+        lines.append("=== Done ===")
+        return "\n".join(lines)
 
-            for canon, group in sorted(unit_groups.items()):
-                existing_canonical.add(canon)
+    @mcp.tool()
+    async def get_system_cleanup_report() -> str:
+        """
+        Scan foods and units and return a read-only report of every change that
+        cleanup_system would apply, with all IDs embedded for review.
 
-                if len(group) > 1:
-                    keep = next((u for u in group if u["name"].lower() == canon), group[0])
-                    for dup in group:
-                        if dup["id"] == keep["id"]:
-                            continue
-                        unit_merges.append((dup["id"], keep["id"], canon))
-                        lines.append(f"  MERGE  '{dup['name']}' → '{canon}'")
-                    if keep["name"] != canon:
-                        unit_renames.append((keep["id"], keep["name"], canon))
-                        lines.append(f"  RENAME '{keep['name']}' → '{canon}'")
-                else:
-                    unit = group[0]
-                    if unit["name"] != canon:
-                        unit_renames.append((unit["id"], unit["name"], canon))
-                        lines.append(f"  RENAME '{unit['name']}' → '{canon}'")
+        No writes are performed. Use this before apply_system_cleanup so you can
+        review and curate the proposed changes — removing anything you disagree
+        with — before committing.
 
-        missing = [u for u in STANDARD_UNITS if u["name"] not in existing_canonical]
-        for u in missing:
-            abbr = f" (abbr: {u['abbreviation']})" if u["abbreviation"] else ""
-            lines.append(f"  ADD    '{u['name']}'{abbr}")
+        Returns:
+            Plain-text report listing every proposed merge, rename, and unit
+            addition, followed by the exact apply_system_cleanup() call structure
+            with IDs pre-filled.
+        """
+        lines = ["=== System Cleanup Report ===", ""]
 
+        try:
+            foods = await get_all(client, "/api/foods")
+        except Exception as exc:
+            return f"ERROR fetching foods: {exc}"
+
+        try:
+            units = await get_all(client, "/api/units")
+        except Exception as exc:
+            return f"ERROR fetching units: {exc}"
+
+        food_merges, food_renames = _compute_food_changes(foods)
+        unit_merges, unit_renames, missing = _compute_unit_changes(units)
+
+        # ── Foods ──────────────────────────────────────────────────────────────
+        lines.append(f"## Foods  ({len(foods)} total · {len(food_merges)} to merge · {len(food_renames)} to rename)")
+        if food_merges:
+            lines.append("")
+            for m in food_merges:
+                lines.append(f"  MERGE  '{m['from_name']}' → '{m['canon']}'")
+                lines.append(f"         from_id: {m['from_id']}  keep_id: {m['keep_id']}")
+        if food_renames:
+            lines.append("")
+            for r in food_renames:
+                lines.append(f"  RENAME '{r['old_name']}' → '{r['new_name']}'")
+                lines.append(f"         id: {r['id']}")
+        if not food_merges and not food_renames:
+            lines.append("  Nothing to do.")
+        lines.append("")
+
+        # ── Units ──────────────────────────────────────────────────────────────
         lines.append(
-            f"  Summary: {len(units)} units · "
-            f"{len(unit_merges)} to merge · {len(unit_renames)} to rename · "
-            f"{len(missing)} to add"
+            f"## Units  ({len(units)} total · {len(unit_merges)} to merge · "
+            f"{len(unit_renames)} to rename · {len(missing)} to add)"
         )
+        if unit_merges:
+            lines.append("")
+            for m in unit_merges:
+                lines.append(f"  MERGE  '{m['from_name']}' → '{m['canon']}'")
+                lines.append(f"         from_id: {m['from_id']}  keep_id: {m['keep_id']}")
+        if unit_renames:
+            lines.append("")
+            for r in unit_renames:
+                lines.append(f"  RENAME '{r['old_name']}' → '{r['new_name']}'")
+                lines.append(f"         id: {r['id']}")
+        if missing:
+            lines.append("")
+            for u in missing:
+                abbr = f" (abbr: {u['abbreviation']})" if u["abbreviation"] else ""
+                lines.append(f"  ADD    '{u['name']}'{abbr}")
+        if not unit_merges and not unit_renames and not missing:
+            lines.append("  Nothing to do.")
+        lines.append("")
 
-        if not dry_run and units is not None:
-            merged = renamed = added = 0
-            for item_id, old_name, canon in unit_renames:
-                if await _rename(client, "/api/units", item_id, canon):
+        # ── Call structure ─────────────────────────────────────────────────────
+        lines += [
+            "## Call apply_system_cleanup() with the following (remove any entries you want to skip):",
+            "",
+            "  food_merges = [",
+        ]
+        for m in food_merges:
+            lines.append(f'    {{"from_id": "{m["from_id"]}", "keep_id": "{m["keep_id"]}"}},  # {m["from_name"]} → {m["canon"]}')
+        lines.append("  ]")
+        lines.append("  food_renames = [")
+        for r in food_renames:
+            lines.append(f'    {{"id": "{r["id"]}", "name": "{r["new_name"]}"}},  # {r["old_name"]}')
+        lines.append("  ]")
+        lines.append("  unit_merges = [")
+        for m in unit_merges:
+            lines.append(f'    {{"from_id": "{m["from_id"]}", "keep_id": "{m["keep_id"]}"}},  # {m["from_name"]} → {m["canon"]}')
+        lines.append("  ]")
+        lines.append("  unit_renames = [")
+        for r in unit_renames:
+            lines.append(f'    {{"id": "{r["id"]}", "name": "{r["new_name"]}"}},  # {r["old_name"]}')
+        lines.append("  ]")
+        lines.append(f"  add_missing_units = {bool(missing)}")
+
+        lines.append("\n=== Done ===")
+        return "\n".join(lines)
+
+    @mcp.tool()
+    async def apply_system_cleanup(
+        food_merges: list[dict] | None = None,
+        food_renames: list[dict] | None = None,
+        unit_merges: list[dict] | None = None,
+        unit_renames: list[dict] | None = None,
+        add_missing_units: bool = True,
+    ) -> str:
+        """
+        Execute a curated set of food/unit changes produced by get_system_cleanup_report.
+
+        All parameters are optional — pass only what you want to apply. A backup
+        is created first (requires an admin-level API token).
+
+        Args:
+            food_merges:       List of {"from_id": str, "keep_id": str}.
+                               The from_id food is merged into keep_id.
+            food_renames:      List of {"id": str, "name": str}.
+                               The food with id is renamed to name.
+            unit_merges:       List of {"from_id": str, "keep_id": str}.
+            unit_renames:      List of {"id": str, "name": str}.
+            add_missing_units: When True (default), create any standard cooking
+                               units that are absent from the database.
+
+        Returns:
+            Plain-text summary of every action taken.
+        """
+        food_merges = food_merges or []
+        food_renames = food_renames or []
+        unit_merges = unit_merges or []
+        unit_renames = unit_renames or []
+
+        if not any([food_merges, food_renames, unit_merges, unit_renames, add_missing_units]):
+            return "Nothing to do — all lists are empty and add_missing_units is False."
+
+        lines = ["=== Apply System Cleanup ===", ""]
+
+        lines.append("## Backup")
+        lines.append(f"  {await _backup(client)}")
+        lines.append("")
+
+        # ── Foods ──────────────────────────────────────────────────────────────
+        if food_merges or food_renames:
+            lines.append("## Foods")
+            merged = renamed = 0
+            for r in food_renames:
+                if await _rename(client, "/api/foods", r["id"], r["name"]):
                     renamed += 1
+                    lines.append(f"  RENAMED → '{r['name']}'")
                 else:
-                    lines.append(f"  WARN: rename failed for '{old_name}'")
-            for dup_id, keep_id, canon in unit_merges:
-                ok = await _merge_units(client, dup_id, keep_id)
+                    lines.append(f"  WARN: rename failed for id {r['id'][:8]}…")
+            for m in food_merges:
+                ok = await _merge_foods(client, m["from_id"], m["keep_id"])
                 if not ok:
-                    ok = await _delete(client, "/api/units", dup_id)
+                    ok = await _delete(client, "/api/foods", m["from_id"])
                 if ok:
                     merged += 1
+                    lines.append(f"  MERGED  {m['from_id'][:8]}… → {m['keep_id'][:8]}…")
                 else:
-                    lines.append(f"  WARN: merge/delete failed for unit {dup_id[:8]}…")
-            for u in missing:
-                payload = {
-                    "name": u["name"],
-                    "pluralName": u["pluralName"],
-                    "abbreviation": u["abbreviation"],
-                    "fraction": u["fraction"],
-                }
-                if await _create_unit(client, payload):
-                    added += 1
+                    lines.append(f"  WARN: merge/delete failed for food {m['from_id'][:8]}…")
+            lines.append(f"  Applied: {merged} merged · {renamed} renamed")
+            lines.append("")
+
+        # ── Units ──────────────────────────────────────────────────────────────
+        if unit_merges or unit_renames or add_missing_units:
+            lines.append("## Units")
+            merged = renamed = added = 0
+            for r in unit_renames:
+                if await _rename(client, "/api/units", r["id"], r["name"]):
+                    renamed += 1
+                    lines.append(f"  RENAMED → '{r['name']}'")
                 else:
-                    lines.append(f"  WARN: failed to create unit '{u['name']}'")
+                    lines.append(f"  WARN: rename failed for id {r['id'][:8]}…")
+            for m in unit_merges:
+                ok = await _merge_units(client, m["from_id"], m["keep_id"])
+                if not ok:
+                    ok = await _delete(client, "/api/units", m["from_id"])
+                if ok:
+                    merged += 1
+                    lines.append(f"  MERGED  {m['from_id'][:8]}… → {m['keep_id'][:8]}…")
+                else:
+                    lines.append(f"  WARN: merge/delete failed for unit {m['from_id'][:8]}…")
+            if add_missing_units:
+                existing = {normalize_unit(u["name"]) for u in await get_all(client, "/api/units")}
+                for u in STANDARD_UNITS:
+                    if u["name"] in existing:
+                        continue
+                    payload = {
+                        "name": u["name"],
+                        "pluralName": u["pluralName"],
+                        "abbreviation": u["abbreviation"],
+                        "fraction": u["fraction"],
+                    }
+                    if await _create_unit(client, payload):
+                        added += 1
+                        lines.append(f"  ADDED   '{u['name']}'")
+                    else:
+                        lines.append(f"  WARN: failed to create unit '{u['name']}'")
             lines.append(f"  Applied: {merged} merged · {renamed} renamed · {added} added")
-        lines.append("")
+            lines.append("")
 
         lines.append("=== Done ===")
         return "\n".join(lines)

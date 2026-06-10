@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import uuid
 from typing import Any
 
 import httpx
@@ -945,6 +946,174 @@ def register_recipe_tools(mcp: Any, client: httpx.AsyncClient) -> None:
 
         # ── Single PUT ────────────────────────────────────────────────────────
         ok = await put_recipe(client, recipe_slug, recipe)
+        lines.append("PUT OK" if ok else "WARN: PUT failed — check Mealie logs")
+        lines.append("\n=== Done ===")
+        return "\n".join(lines)
+
+    @mcp.tool()
+    async def set_recipe_ingredients(
+        recipe_slug: str,
+        ingredients: list[dict],
+    ) -> str:
+        """
+        Replace the full ingredient list of a recipe in one PUT.
+
+        Each entry in `ingredients` is a dict with:
+          food_name              (str) — required unless using referenced_recipe_slug or title only
+          referenced_recipe_slug (str) — link ingredient to a sub-recipe instead of a food
+          unit_name              (str, optional)
+          quantity               (float, optional)
+          note                   (str, optional)
+          title                  (str, optional) — set alone (no food/recipe) for a section header
+
+        Missing foods and units are created automatically. Every ingredient is
+        assigned a fresh referenceId. The tool returns these IDs at the end of the
+        output so they can be passed to set_recipe_steps to wire ingredient references.
+
+        Args:
+            recipe_slug:  Slug or UUID of the recipe to update.
+            ingredients:  Ordered list of ingredient specs (see above).
+
+        Returns:
+            Plain-text summary of each ingredient written, the assigned referenceIds,
+            and the PUT status.
+        """
+        try:
+            recipe = await get_recipe(client, recipe_slug)
+        except Exception as exc:
+            return f"ERROR: could not fetch recipe '{recipe_slug}': {exc}"
+
+        recipe_name = recipe.get("name", recipe_slug)
+        lines = [f"=== Set Recipe Ingredients: {recipe_name} ===", ""]
+
+        foods, units = await asyncio.gather(
+            get_all(client, "/api/foods"),
+            get_all(client, "/api/units"),
+        )
+        food_map = {normalize_food(f["name"]): f for f in foods}
+        unit_map = {normalize_unit(u["name"]): u for u in units}
+
+        new_ingredients: list[dict] = []
+        for spec in ingredients:
+            ref_id = str(uuid.uuid4())
+            food_name = spec.get("food_name", "")
+            ref_recipe_slug = spec.get("referenced_recipe_slug", "")
+            unit_name = spec.get("unit_name", "")
+            quantity = spec.get("quantity")
+            note = spec.get("note", "")
+            title = spec.get("title", "")
+
+            ing: dict = {
+                "referenceId": ref_id,
+                "quantity": quantity,
+                "note": note,
+                "title": title,
+                "food": None,
+                "unit": None,
+                "referencedRecipe": None,
+            }
+
+            if ref_recipe_slug:
+                try:
+                    ref_recipe = await get_recipe(client, ref_recipe_slug)
+                    ing["referencedRecipe"] = {
+                        "id": ref_recipe["id"],
+                        "name": ref_recipe["name"],
+                        "slug": ref_recipe.get("slug", ref_recipe_slug),
+                    }
+                    lines.append(f"  [{ref_id}] sub-recipe '{ref_recipe.get('name', ref_recipe_slug)}' [linked]")
+                except Exception as exc:
+                    lines.append(f"  [{ref_id}] FAILED: could not fetch '{ref_recipe_slug}': {exc}")
+                    continue
+            elif food_name:
+                food, action = await find_or_create_food(client, food_name, food_map)
+                if food is None:
+                    lines.append(f"  [{ref_id}] FAILED: could not find or create food '{food_name}'")
+                    continue
+                ing["food"] = food
+                label = f"'{food['name']}' [{action}]"
+                if unit_name:
+                    unit, u_action = await find_or_create_unit(client, unit_name, unit_map)
+                    if unit:
+                        ing["unit"] = unit
+                        label += f" + '{unit['name']}' [{u_action}]"
+                    else:
+                        label += f" + unit '{unit_name}' [FAILED]"
+                if quantity is not None:
+                    label += f" qty={quantity}"
+                lines.append(f"  [{ref_id}] {label}")
+            elif title:
+                lines.append(f"  [{ref_id}] section '{title}'")
+            else:
+                lines.append(f"  WARN: skipping entry with no food_name, referenced_recipe_slug, or title: {spec}")
+                continue
+
+            new_ingredients.append(ing)
+
+        recipe["recipeIngredient"] = new_ingredients
+        ok = await put_recipe(client, recipe_slug, recipe)
+        lines.append("")
+        lines.append("PUT OK" if ok else "WARN: PUT failed — check Mealie logs")
+        lines.append("")
+        lines.append("referenceIds (pass to set_recipe_steps):")
+        for ing in new_ingredients:
+            food_obj = ing.get("food") or {}
+            ref_obj = ing.get("referencedRecipe") or {}
+            display = food_obj.get("name") or ref_obj.get("name") or ing.get("title") or "(note-only)"
+            lines.append(f"  {ing['referenceId']}  {display}")
+        lines.append("\n=== Done ===")
+        return "\n".join(lines)
+
+    @mcp.tool()
+    async def set_recipe_steps(
+        recipe_slug: str,
+        steps: list[dict],
+    ) -> str:
+        """
+        Replace the full step list of a recipe in one PUT.
+
+        Each entry in `steps` is a dict with:
+          text                  (str, required)
+          title                 (str, optional) — section header shown above the step
+          ingredient_references (list[str], optional) — referenceIds of ingredients
+                                used in this step; get these from set_recipe_ingredients
+
+        Args:
+            recipe_slug: Slug or UUID of the recipe to update.
+            steps:       Ordered list of step specs (see above).
+
+        Returns:
+            Plain-text summary of steps written and the PUT status.
+        """
+        try:
+            recipe = await get_recipe(client, recipe_slug)
+        except Exception as exc:
+            return f"ERROR: could not fetch recipe '{recipe_slug}': {exc}"
+
+        recipe_name = recipe.get("name", recipe_slug)
+        lines = [f"=== Set Recipe Steps: {recipe_name} ===", ""]
+
+        new_steps: list[dict] = []
+        for i, spec in enumerate(steps, 1):
+            text = spec.get("text", "")
+            if not text:
+                lines.append(f"  WARN: step {i} has no text — skipping")
+                continue
+            ref_ids = spec.get("ingredient_references") or []
+            step = {
+                "id": str(uuid.uuid4()),
+                "title": spec.get("title", ""),
+                "text": text,
+                "ingredientReferences": [{"referenceId": r} for r in ref_ids],
+            }
+            preview = text[:60].replace("\n", " ")
+            lines.append(f"  Step {i}: {preview}{'…' if len(text) > 60 else ''} ({len(ref_ids)} ref(s))")
+            new_steps.append(step)
+
+        recipe["recipeInstructions"] = new_steps
+        ok = await put_recipe(client, recipe_slug, recipe)
+        lines.append("")
+        lines.append(f"  {len(new_steps)} step(s) written")
         lines.append("PUT OK" if ok else "WARN: PUT failed — check Mealie logs")
         lines.append("\n=== Done ===")
         return "\n".join(lines)

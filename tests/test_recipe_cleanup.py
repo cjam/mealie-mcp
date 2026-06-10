@@ -802,6 +802,203 @@ async def test_fix_ingredient_links_sub_recipe(mealie_http, mcp_server):
         await _delete_recipe(mealie_http, sub_slug)
 
 
+# ── Tests: set_recipe_ingredients ────────────────────────────────────────────
+
+async def test_set_recipe_ingredients_registered(mcp_server):
+    async with Client(mcp_server) as client:
+        tools = await client.list_tools()
+    assert "set_recipe_ingredients" in [t.name for t in tools]
+
+
+async def test_set_recipe_ingredients_replaces_list(mealie_http, mcp_server):
+    """set_recipe_ingredients writes a full ingredient list with resolved food/unit."""
+    slug = await _create_recipe(mealie_http, "SetIngredients: Basic")
+    try:
+        async with Client(mcp_server) as mcp:
+            result = await mcp.call_tool(
+                "set_recipe_ingredients",
+                {
+                    "recipe_slug": slug,
+                    "ingredients": [
+                        {"food_name": "flour", "unit_name": "cup", "quantity": 2.0},
+                        {"food_name": "salt", "quantity": 0.5, "note": "to taste"},
+                    ],
+                },
+            )
+        text = result.content[0].text
+        assert "error" not in text.lower(), f"Unexpected error:\n{text}"
+        assert "PUT OK" in text
+
+        recipe = await _get_recipe(mealie_http, slug)
+        ings = recipe["recipeIngredient"]
+        assert len(ings) == 2
+        assert ings[0]["food"]["name"].lower() == "flour"
+        assert ings[1]["food"]["name"].lower() == "salt"
+        assert ings[1]["note"] == "to taste"
+    finally:
+        await _delete_recipe(mealie_http, slug)
+
+
+async def test_set_recipe_ingredients_returns_reference_ids(mealie_http, mcp_server):
+    """Output lists a referenceId for every ingredient written."""
+    import re
+    slug = await _create_recipe(mealie_http, "SetIngredients: RefIds")
+    try:
+        async with Client(mcp_server) as mcp:
+            result = await mcp.call_tool(
+                "set_recipe_ingredients",
+                {
+                    "recipe_slug": slug,
+                    "ingredients": [
+                        {"food_name": "butter", "unit_name": "tablespoon", "quantity": 3.0},
+                    ],
+                },
+            )
+        text = result.content[0].text
+        assert "referenceIds" in text
+        uuids = re.findall(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", text)
+        assert len(uuids) >= 1
+    finally:
+        await _delete_recipe(mealie_http, slug)
+
+
+async def test_set_recipe_ingredients_links_sub_recipe(mealie_http, mcp_server):
+    """An ingredient with referenced_recipe_slug links a sub-recipe."""
+    parent_slug = await _create_recipe(mealie_http, "SetIngredients: Parent")
+    sub_slug = await _create_recipe(mealie_http, "SetIngredients: Sub")
+    try:
+        sub_id = (await _get_recipe(mealie_http, sub_slug))["id"]
+        async with Client(mcp_server) as mcp:
+            result = await mcp.call_tool(
+                "set_recipe_ingredients",
+                {
+                    "recipe_slug": parent_slug,
+                    "ingredients": [
+                        {"referenced_recipe_slug": sub_slug, "quantity": 1.0},
+                    ],
+                },
+            )
+        text = result.content[0].text
+        assert "PUT OK" in text
+
+        recipe = await _get_recipe(mealie_http, parent_slug)
+        ing = recipe["recipeIngredient"][0]
+        assert ing["referencedRecipe"] is not None
+        assert ing["referencedRecipe"]["id"] == sub_id
+    finally:
+        await _delete_recipe(mealie_http, parent_slug)
+        await _delete_recipe(mealie_http, sub_slug)
+
+
+async def test_set_recipe_ingredients_section_header(mealie_http, mcp_server):
+    """A title-only entry creates a section header ingredient."""
+    slug = await _create_recipe(mealie_http, "SetIngredients: Sections")
+    try:
+        async with Client(mcp_server) as mcp:
+            result = await mcp.call_tool(
+                "set_recipe_ingredients",
+                {
+                    "recipe_slug": slug,
+                    "ingredients": [
+                        {"title": "For the sauce"},
+                        {"food_name": "tomato", "quantity": 3.0},
+                    ],
+                },
+            )
+        text = result.content[0].text
+        assert "PUT OK" in text
+
+        recipe = await _get_recipe(mealie_http, slug)
+        ings = recipe["recipeIngredient"]
+        assert len(ings) == 2
+        assert ings[0]["title"] == "For the sauce"
+        assert ings[0]["food"] is None
+    finally:
+        await _delete_recipe(mealie_http, slug)
+
+
+# ── Tests: set_recipe_steps ───────────────────────────────────────────────────
+
+async def test_set_recipe_steps_registered(mcp_server):
+    async with Client(mcp_server) as client:
+        tools = await client.list_tools()
+    assert "set_recipe_steps" in [t.name for t in tools]
+
+
+async def test_set_recipe_steps_replaces_list(mealie_http, mcp_server):
+    """set_recipe_steps writes a full step list."""
+    slug = await _create_recipe(mealie_http, "SetSteps: Basic")
+    try:
+        async with Client(mcp_server) as mcp:
+            result = await mcp.call_tool(
+                "set_recipe_steps",
+                {
+                    "recipe_slug": slug,
+                    "steps": [
+                        {"text": "Mix the dry ingredients."},
+                        {"text": "Add wet ingredients and stir."},
+                        {"text": "Bake at 350°F for 30 minutes."},
+                    ],
+                },
+            )
+        text = result.content[0].text
+        assert "error" not in text.lower(), f"Unexpected error:\n{text}"
+        assert "3 step(s) written" in text
+        assert "PUT OK" in text
+
+        recipe = await _get_recipe(mealie_http, slug)
+        steps = recipe["recipeInstructions"]
+        assert len(steps) == 3
+        assert steps[0]["text"] == "Mix the dry ingredients."
+        assert steps[2]["text"] == "Bake at 350°F for 30 minutes."
+    finally:
+        await _delete_recipe(mealie_http, slug)
+
+
+async def test_set_recipe_steps_wires_ingredient_references(mealie_http, mcp_server):
+    """set_recipe_steps attaches ingredient referenceIds from set_recipe_ingredients."""
+    import re
+    slug = await _create_recipe(mealie_http, "SetSteps: RefIds")
+    try:
+        async with Client(mcp_server) as mcp:
+            ing_result = await mcp.call_tool(
+                "set_recipe_ingredients",
+                {
+                    "recipe_slug": slug,
+                    "ingredients": [
+                        {"food_name": "egg", "quantity": 2.0},
+                        {"food_name": "milk", "unit_name": "cup", "quantity": 0.5},
+                    ],
+                },
+            )
+        ing_text = ing_result.content[0].text
+        # Deduplicate: each UUID appears once in the detail line and once in the summary.
+        ref_ids = list(dict.fromkeys(re.findall(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", ing_text)))
+        assert len(ref_ids) == 2
+
+        async with Client(mcp_server) as mcp:
+            step_result = await mcp.call_tool(
+                "set_recipe_steps",
+                {
+                    "recipe_slug": slug,
+                    "steps": [
+                        {
+                            "text": "Whisk eggs and milk together.",
+                            "ingredient_references": ref_ids,
+                        }
+                    ],
+                },
+            )
+        assert "PUT OK" in step_result.content[0].text
+
+        recipe = await _get_recipe(mealie_http, slug)
+        step = recipe["recipeInstructions"][0]
+        linked = [r["referenceId"] for r in step.get("ingredientReferences") or []]
+        assert set(linked) == set(ref_ids)
+    finally:
+        await _delete_recipe(mealie_http, slug)
+
+
 # ── Tests: create_recipe ──────────────────────────────────────────────────────
 
 

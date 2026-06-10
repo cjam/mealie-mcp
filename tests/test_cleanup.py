@@ -431,3 +431,132 @@ async def test_update_many_foods_partial_not_found(mcp_server):
             },
         )
     assert "1 failed" in result.content[0].text or "ERROR" in result.content[0].text
+
+
+# ── Tests: get_system_cleanup_report ─────────────────────────────────────────
+
+async def test_get_system_cleanup_report_registered(mcp_server):
+    async with Client(mcp_server) as client:
+        tools = await client.list_tools()
+    assert "get_system_cleanup_report" in [t.name for t in tools]
+
+
+async def test_get_system_cleanup_report_no_writes(mealie_http, mcp_server):
+    """Report makes no changes — duplicate food still exists after the call."""
+    await _purge_foods(mealie_http, "basil", "Basil")
+    id1 = await _create_food(mealie_http, "basil")
+    id2 = await _create_food(mealie_http, "Basil")
+    try:
+        async with Client(mcp_server) as mcp:
+            result = await mcp.call_tool("get_system_cleanup_report", {})
+        text = result.content[0].text
+        assert "MERGE" in text
+        # Both IDs must appear in the report.
+        assert id1 in text or id2 in text
+        # Duplicate must still exist — no writes performed.
+        names = await _food_names(mealie_http)
+        assert "basil" in names or "Basil" in names
+        assert len([n for n in names if n.lower() == "basil"]) == 2
+    finally:
+        await _purge_foods(mealie_http, "basil", "Basil")
+
+
+async def test_get_system_cleanup_report_embeds_ids(mealie_http, mcp_server):
+    """Report output includes from_id and keep_id for each food merge."""
+    await _purge_foods(mealie_http, "oregano", "Oregano")
+    id1 = await _create_food(mealie_http, "oregano")
+    id2 = await _create_food(mealie_http, "Oregano")
+    try:
+        async with Client(mcp_server) as mcp:
+            result = await mcp.call_tool("get_system_cleanup_report", {})
+        text = result.content[0].text
+        assert id1 in text
+        assert id2 in text
+        assert "from_id" in text
+        assert "keep_id" in text
+    finally:
+        await _purge_foods(mealie_http, "oregano", "Oregano")
+
+
+# ── Tests: apply_system_cleanup ───────────────────────────────────────────────
+
+async def test_apply_system_cleanup_registered(mcp_server):
+    async with Client(mcp_server) as client:
+        tools = await client.list_tools()
+    assert "apply_system_cleanup" in [t.name for t in tools]
+
+
+async def test_apply_system_cleanup_merges_food(mealie_http, mcp_server):
+    """apply_system_cleanup merges a food given explicit from/keep IDs."""
+    await _purge_foods(mealie_http, "thyme", "Thyme")
+    from_id = await _create_food(mealie_http, "thyme")
+    keep_id = await _create_food(mealie_http, "Thyme")
+    try:
+        async with Client(mcp_server) as mcp:
+            result = await mcp.call_tool(
+                "apply_system_cleanup",
+                {
+                    "food_merges": [{"from_id": from_id, "keep_id": keep_id}],
+                    "add_missing_units": False,
+                },
+            )
+        text = result.content[0].text
+        assert "1 merged" in text
+        names = await _food_names(mealie_http)
+        assert len([n for n in names if n.lower() == "thyme"]) == 1
+    finally:
+        await _purge_foods(mealie_http, "thyme", "Thyme")
+
+
+async def test_apply_system_cleanup_renames_food(mealie_http, mcp_server):
+    """apply_system_cleanup renames a food by ID."""
+    await _purge_foods(mealie_http, "rosemery", "Rosemary")
+    food_id = await _create_food(mealie_http, "rosemery")
+    try:
+        async with Client(mcp_server) as mcp:
+            result = await mcp.call_tool(
+                "apply_system_cleanup",
+                {
+                    "food_renames": [{"id": food_id, "name": "Rosemary"}],
+                    "add_missing_units": False,
+                },
+            )
+        text = result.content[0].text
+        assert "1 renamed" in text
+        names = await _food_names(mealie_http)
+        assert "Rosemary" in names
+        assert "rosemery" not in names
+    finally:
+        await _purge_foods(mealie_http, "rosemery", "Rosemary")
+
+
+async def test_apply_system_cleanup_report_then_apply(mealie_http, mcp_server):
+    """Full round-trip: report produces IDs that apply_system_cleanup consumes."""
+    import re
+    await _purge_foods(mealie_http, "sage", "Sage")
+    await _create_food(mealie_http, "sage")
+    await _create_food(mealie_http, "Sage")
+    try:
+        async with Client(mcp_server) as mcp:
+            report = await mcp.call_tool("get_system_cleanup_report", {})
+        text = report.content[0].text
+
+        # Extract the first from_id/keep_id pair for "sage" from the call structure.
+        pattern = r'\{"from_id": "([^"]+)", "keep_id": "([^"]+)"\}.*?sage'
+        m = re.search(pattern, text, re.IGNORECASE)
+        assert m is not None, f"Could not find sage merge entry in report:\n{text}"
+        from_id, keep_id = m.group(1), m.group(2)
+
+        async with Client(mcp_server) as mcp:
+            result = await mcp.call_tool(
+                "apply_system_cleanup",
+                {
+                    "food_merges": [{"from_id": from_id, "keep_id": keep_id}],
+                    "add_missing_units": False,
+                },
+            )
+        assert "1 merged" in result.content[0].text
+        names = await _food_names(mealie_http)
+        assert len([n for n in names if n.lower() == "sage"]) == 1
+    finally:
+        await _purge_foods(mealie_http, "sage", "Sage")
