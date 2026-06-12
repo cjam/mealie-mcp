@@ -23,6 +23,171 @@ from utils import (
 _SUGGEST_PATH = "/api/recipes/suggestions"
 
 
+async def _enrich_recipe_impl(
+    client: httpx.AsyncClient,
+    recipe_slug: str,
+    step_ingredient_map: dict[str, list[str]] | None,
+    tags: list[str] | None,
+    categories: list[str] | None,
+    ingredient_fixes: list[dict] | None,
+) -> str:
+    try:
+        recipe = await get_recipe(client, recipe_slug)
+    except Exception as exc:
+        return f"ERROR: could not fetch recipe '{recipe_slug}': {exc}"
+
+    recipe_name = recipe.get("name", recipe_slug)
+    lines: list[str] = [f"=== Enrich Recipe: {recipe_name} ===", ""]
+
+    foods, units, existing_tags, existing_cats = await asyncio.gather(
+        get_all(client, "/api/foods"),
+        get_all(client, "/api/units"),
+        get_all(client, "/api/organizers/tags"),
+        get_all(client, "/api/organizers/categories"),
+    )
+    food_map = {normalize_food(f["name"]): f for f in foods}
+    unit_map = {normalize_unit(u["name"]): u for u in units}
+
+    # ── Ingredient fixes ──────────────────────────────────────────────────
+    if ingredient_fixes:
+        lines.append("## Ingredient Fixes")
+        ingredients: list[dict] = recipe.get("recipeIngredient") or []
+        ing_by_ref = {ing.get("referenceId"): ing for ing in ingredients}
+
+        for fix in ingredient_fixes:
+            ref_id = fix.get("reference_id") or fix.get("referenceId")
+            food_name_fix = fix.get("food_name") or fix.get("foodName", "")
+            unit_name_fix = fix.get("unit_name") or fix.get("unitName", "")
+            quantity_fix = fix.get("quantity")
+            note_fix = fix.get("note", "")
+            ref_recipe_slug_fix = fix.get("reference_recipe_slug") or fix.get("referenceRecipeSlug", "")
+
+            if not ref_id or (not food_name_fix and not ref_recipe_slug_fix):
+                lines.append(f"  WARN: skipping fix missing reference_id or food_name/reference_recipe_slug: {fix}")
+                continue
+
+            ing = ing_by_ref.get(ref_id)
+            if ing is None:
+                lines.append(f"  WARN: no ingredient with referenceId '{ref_id}'")
+                continue
+
+            parts: list[str] = []
+
+            if ref_recipe_slug_fix:
+                try:
+                    ref_recipe = await get_recipe(client, ref_recipe_slug_fix)
+                    ing["referencedRecipe"] = {
+                        "id": ref_recipe["id"],
+                        "name": ref_recipe["name"],
+                        "slug": ref_recipe.get("slug", ref_recipe_slug_fix),
+                    }
+                    ing["food"] = None
+                    parts.append(f"sub-recipe '{ref_recipe.get('name', ref_recipe_slug_fix)}' [linked]")
+                except Exception as exc:
+                    lines.append(f"  [{ref_id}] FAILED: could not fetch reference recipe '{ref_recipe_slug_fix}': {exc}")
+                    continue
+            else:
+                food, action = await find_or_create_food(client, food_name_fix, food_map)
+                if food is None:
+                    lines.append(f"  [{ref_id}] FAILED: could not find or create food '{food_name_fix}'")
+                    continue
+                ing["food"] = food
+                parts.append(f"food '{food['name']}' [{action}]")
+
+            if unit_name_fix:
+                unit, u_action = await find_or_create_unit(client, unit_name_fix, unit_map)
+                if unit:
+                    ing["unit"] = unit
+                    parts.append(f"unit '{unit['name']}' [{u_action}]")
+                else:
+                    parts.append(f"unit '{unit_name_fix}' [FAILED]")
+
+            if quantity_fix is not None:
+                ing["quantity"] = quantity_fix
+                parts.append(f"quantity={quantity_fix}")
+
+            if note_fix:
+                ing["note"] = note_fix
+                parts.append(f"note='{note_fix}'")
+
+            lines.append(f"  [{ref_id}] {' | '.join(parts)}")
+
+        lines.append("")
+
+    # ── Step linking ──────────────────────────────────────────────────────
+    if step_ingredient_map:
+        lines.append("## Step Linking")
+        steps: list[dict] = recipe.get("recipeInstructions") or []
+        step_by_id = {s.get("id"): s for s in steps}
+        applied = 0
+
+        for sid in sorted(set(step_ingredient_map) - set(step_by_id)):
+            lines.append(f"  WARN: step ID not found in recipe — {sid}")
+
+        for step in steps:
+            sid = step.get("id")
+            if sid not in step_ingredient_map:
+                continue
+            ref_ids = step_ingredient_map[sid]
+            step["ingredientReferences"] = [{"referenceId": r} for r in ref_ids]
+            text = (step.get("text") or "")[:80].replace("\n", " ")
+            lines.append(f"  [{sid}] {len(ref_ids)} ref(s) → {text}…")
+            applied += 1
+
+        lines.append(f"  {applied} step(s) updated")
+        lines.append("")
+
+    # ── Tags ──────────────────────────────────────────────────────────────
+    if tags is not None:
+        lines.append("## Tags")
+        tag_map = {t["name"].lower(): t for t in existing_tags}
+        resolved_tags: list[dict] = []
+        for name in tags:
+            tag = tag_map.get(name.lower())
+            if tag:
+                resolved_tags.append(tag)
+                lines.append(f"  '{name}' [found]")
+            else:
+                try:
+                    r = await client.post("/api/organizers/tags", json={"name": name})
+                    r.raise_for_status()
+                    tag = r.json()
+                    resolved_tags.append(tag)
+                    lines.append(f"  '{name}' [created]")
+                except Exception as exc:
+                    lines.append(f"  '{name}' [FAILED: {exc}]")
+        recipe["tags"] = resolved_tags
+        lines.append("")
+
+    # ── Categories ────────────────────────────────────────────────────────
+    if categories is not None:
+        lines.append("## Categories")
+        cat_map = {c["name"].lower(): c for c in existing_cats}
+        resolved_cats: list[dict] = []
+        for name in categories:
+            cat = cat_map.get(name.lower())
+            if cat:
+                resolved_cats.append(cat)
+                lines.append(f"  '{name}' [found]")
+            else:
+                try:
+                    r = await client.post("/api/organizers/categories", json={"name": name})
+                    r.raise_for_status()
+                    cat = r.json()
+                    resolved_cats.append(cat)
+                    lines.append(f"  '{name}' [created]")
+                except Exception as exc:
+                    lines.append(f"  '{name}' [FAILED: {exc}]")
+        recipe["recipeCategory"] = resolved_cats
+        lines.append("")
+
+    # ── Single PUT ────────────────────────────────────────────────────────
+    ok = await put_recipe(client, recipe_slug, recipe)
+    lines.append("PUT OK" if ok else "WARN: PUT failed — check Mealie logs")
+    lines.append("\n=== Done ===")
+    return "\n".join(lines)
+
+
 def register_recipe_tools(mcp: Any, client: httpx.AsyncClient) -> None:
 
     @mcp.tool()
@@ -794,160 +959,173 @@ def register_recipe_tools(mcp: Any, client: httpx.AsyncClient) -> None:
         if not any([step_ingredient_map, tags is not None, categories is not None, ingredient_fixes]):
             return "Nothing to do — provide at least one of: step_ingredient_map, tags, categories, ingredient_fixes"
 
-        try:
-            recipe = await get_recipe(client, recipe_slug)
-        except Exception as exc:
-            return f"ERROR: could not fetch recipe '{recipe_slug}': {exc}"
-
-        recipe_name = recipe.get("name", recipe_slug)
-        lines: list[str] = [f"=== Enrich Recipe: {recipe_name} ===", ""]
-
-        foods, units, existing_tags, existing_cats = await asyncio.gather(
-            get_all(client, "/api/foods"),
-            get_all(client, "/api/units"),
-            get_all(client, "/api/organizers/tags"),
-            get_all(client, "/api/organizers/categories"),
+        return await _enrich_recipe_impl(
+            client, recipe_slug,
+            step_ingredient_map=step_ingredient_map,
+            tags=tags,
+            categories=categories,
+            ingredient_fixes=ingredient_fixes,
         )
-        food_map = {normalize_food(f["name"]): f for f in foods}
-        unit_map = {normalize_unit(u["name"]): u for u in units}
 
-        # ── Ingredient fixes ──────────────────────────────────────────────────
-        if ingredient_fixes:
-            lines.append("## Ingredient Fixes")
-            ingredients: list[dict] = recipe.get("recipeIngredient") or []
-            ing_by_ref = {ing.get("referenceId"): ing for ing in ingredients}
+    @mcp.tool()
+    async def get_import_queue_report(urls: list[str]) -> str:
+        """
+        Preview scraped recipe data for a list of URLs without importing them.
 
-            for fix in ingredient_fixes:
-                ref_id = fix.get("reference_id") or fix.get("referenceId")
-                food_name_fix = fix.get("food_name") or fix.get("foodName", "")
-                unit_name_fix = fix.get("unit_name") or fix.get("unitName", "")
-                quantity_fix = fix.get("quantity")
-                note_fix = fix.get("note", "")
-                ref_recipe_slug_fix = fix.get("reference_recipe_slug") or fix.get("referenceRecipeSlug", "")
+        For each URL, calls Mealie's test-scrape endpoint and returns the parsed
+        recipe data (name, description, ingredients, steps) for AI review. No
+        recipes are created or modified.
 
-                if not ref_id or (not food_name_fix and not ref_recipe_slug_fix):
-                    lines.append(f"  WARN: skipping fix missing reference_id or food_name/reference_recipe_slug: {fix}")
-                    continue
+        Use this before apply_import_queue to decide tags, categories, and
+        enrichment for each recipe in the batch. Scrapes all URLs in parallel.
 
-                ing = ing_by_ref.get(ref_id)
-                if ing is None:
-                    lines.append(f"  WARN: no ingredient with referenceId '{ref_id}'")
-                    continue
+        Args:
+            urls: List of public recipe URLs to preview.
 
-                parts: list[str] = []
+        Returns:
+            Structured plain-text preview — name, description, ingredient list,
+            and step list for each URL. Scrape errors are shown inline per URL
+            without aborting the rest of the batch.
+        """
+        async def _scrape_one(url: str) -> tuple[str, dict | str]:
+            try:
+                r = await client.post("/api/recipes/test-scrape-url", json={"url": url})
+                r.raise_for_status()
+                return url, r.json()
+            except Exception as exc:
+                return url, f"ERROR: {exc}"
 
-                if ref_recipe_slug_fix:
-                    try:
-                        ref_recipe = await get_recipe(client, ref_recipe_slug_fix)
-                        ing["referencedRecipe"] = {
-                            "id": ref_recipe["id"],
-                            "name": ref_recipe["name"],
-                            "slug": ref_recipe.get("slug", ref_recipe_slug_fix),
-                        }
-                        ing["food"] = None
-                        parts.append(f"sub-recipe '{ref_recipe.get('name', ref_recipe_slug_fix)}' [linked]")
-                    except Exception as exc:
-                        lines.append(f"  [{ref_id}] FAILED: could not fetch reference recipe '{ref_recipe_slug_fix}': {exc}")
-                        continue
+        results = await asyncio.gather(*[_scrape_one(url) for url in urls])
+
+        lines = [f"=== Import Queue Report: {len(urls)} URL(s) ==="]
+        for url, data in results:
+            lines += ["", f"## {url}"]
+            if isinstance(data, str):
+                lines.append(f"  {data}")
+                continue
+            if not data:
+                lines.append("  ERROR: scrape returned empty response")
+                continue
+
+            name = data.get("name") or "(no name)"
+            desc = (data.get("description") or "").strip()
+            ingredients: list[dict] = data.get("recipeIngredient") or []
+            steps: list[dict] = data.get("recipeInstructions") or []
+
+            lines.append(f"Name: {name}")
+            if desc:
+                lines.append(f"Description: {desc[:200]}")
+
+            lines.append(f"Ingredients ({len(ingredients)}):")
+            for i, ing in enumerate(ingredients[:30], 1):
+                if isinstance(ing, str):
+                    original = ing.strip()
                 else:
-                    food, action = await find_or_create_food(client, food_name_fix, food_map)
-                    if food is None:
-                        lines.append(f"  [{ref_id}] FAILED: could not find or create food '{food_name_fix}'")
-                        continue
-                    ing["food"] = food
-                    parts.append(f"food '{food['name']}' [{action}]")
+                    original = (ing.get("originalText") or ing.get("note") or "?").strip()
+                lines.append(f"  {i}. {original}")
+            if len(ingredients) > 30:
+                lines.append(f"  … and {len(ingredients) - 30} more")
 
-                if unit_name_fix:
-                    unit, u_action = await find_or_create_unit(client, unit_name_fix, unit_map)
-                    if unit:
-                        ing["unit"] = unit
-                        parts.append(f"unit '{unit['name']}' [{u_action}]")
-                    else:
-                        parts.append(f"unit '{unit_name_fix}' [FAILED]")
+            lines.append(f"Steps ({len(steps)}):")
+            for i, step in enumerate(steps[:15], 1):
+                text = (step.get("text") or "").strip()[:120].replace("\n", " ")
+                lines.append(f"  [{i}] {text}")
+            if len(steps) > 15:
+                lines.append(f"  … and {len(steps) - 15} more")
 
-                if quantity_fix is not None:
-                    ing["quantity"] = quantity_fix
-                    parts.append(f"quantity={quantity_fix}")
+        return "\n".join(lines)
 
-                if note_fix:
-                    ing["note"] = note_fix
-                    parts.append(f"note='{note_fix}'")
+    @mcp.tool()
+    async def apply_import_queue(configs: list[dict]) -> str:
+        """
+        Import and enrich a batch of recipes from URLs.
 
-                lines.append(f"  [{ref_id}] {' | '.join(parts)}")
+        For each config, imports the URL into Mealie, resolves food and unit
+        references (cleanup), then applies taxonomy and optional enrichments in
+        a single PUT. Runs sequentially so Mealie is not overwhelmed.
 
-            lines.append("")
+        After this call, each recipe's ingredient referenceIds and step IDs are
+        included in the output. Use those to call enrich_recipe for any
+        step-ingredient links that were not provided here.
 
-        # ── Step linking ──────────────────────────────────────────────────────
-        if step_ingredient_map:
-            lines.append("## Step Linking")
-            steps: list[dict] = recipe.get("recipeInstructions") or []
-            step_by_id = {s.get("id"): s for s in steps}
-            applied = 0
+        Each config dict accepts:
+          url                  (str, required)  public recipe URL to import
+          tags                 (list[str])       tag names — created if missing
+          categories           (list[str])       category names — created if missing
+          step_ingredient_map  (dict)            step ID → list of referenceIds
+          ingredient_fixes     (list[dict])      corrections (same format as
+                                                  enrich_recipe's ingredient_fixes)
 
-            for sid in sorted(set(step_ingredient_map) - set(step_by_id)):
-                lines.append(f"  WARN: step ID not found in recipe — {sid}")
+        Note: step_ingredient_map and ingredient_fixes require knowing the actual
+        IDs, which are only available after import + cleanup. Omit them here and
+        use the returned IDs to call enrich_recipe in a follow-up if needed.
 
-            for step in steps:
-                sid = step.get("id")
-                if sid not in step_ingredient_map:
-                    continue
-                ref_ids = step_ingredient_map[sid]
-                step["ingredientReferences"] = [{"referenceId": r} for r in ref_ids]
-                text = (step.get("text") or "")[:80].replace("\n", " ")
-                lines.append(f"  [{sid}] {len(ref_ids)} ref(s) → {text}…")
-                applied += 1
+        Args:
+            configs: Ordered list of import config dicts (see above).
 
-            lines.append(f"  {applied} step(s) updated")
-            lines.append("")
+        Returns:
+            Per-recipe status block: slug, cleanup summary, enrichment applied,
+            and a final summary line of totals.
+        """
+        lines = [f"=== Import Queue: {len(configs)} recipe(s) ==="]
+        imported = 0
+        failed = 0
 
-        # ── Tags ──────────────────────────────────────────────────────────────
-        if tags is not None:
-            lines.append("## Tags")
-            tag_map = {t["name"].lower(): t for t in existing_tags}
-            resolved_tags: list[dict] = []
-            for name in tags:
-                tag = tag_map.get(name.lower())
-                if tag:
-                    resolved_tags.append(tag)
-                    lines.append(f"  '{name}' [found]")
-                else:
-                    try:
-                        r = await client.post("/api/organizers/tags", json={"name": name})
-                        r.raise_for_status()
-                        tag = r.json()
-                        resolved_tags.append(tag)
-                        lines.append(f"  '{name}' [created]")
-                    except Exception as exc:
-                        lines.append(f"  '{name}' [FAILED: {exc}]")
-            recipe["tags"] = resolved_tags
-            lines.append("")
+        for i, config in enumerate(configs, 1):
+            url = config.get("url", "")
+            tags = config.get("tags")
+            categories = config.get("categories")
+            step_map = config.get("step_ingredient_map")
+            fixes = config.get("ingredient_fixes")
 
-        # ── Categories ────────────────────────────────────────────────────────
-        if categories is not None:
-            lines.append("## Categories")
-            cat_map = {c["name"].lower(): c for c in existing_cats}
-            resolved_cats: list[dict] = []
-            for name in categories:
-                cat = cat_map.get(name.lower())
-                if cat:
-                    resolved_cats.append(cat)
-                    lines.append(f"  '{name}' [found]")
-                else:
-                    try:
-                        r = await client.post("/api/organizers/categories", json={"name": name})
-                        r.raise_for_status()
-                        cat = r.json()
-                        resolved_cats.append(cat)
-                        lines.append(f"  '{name}' [created]")
-                    except Exception as exc:
-                        lines.append(f"  '{name}' [FAILED: {exc}]")
-            recipe["recipeCategory"] = resolved_cats
-            lines.append("")
+            lines += ["", f"[{i}/{len(configs)}] {url}"]
 
-        # ── Single PUT ────────────────────────────────────────────────────────
-        ok = await put_recipe(client, recipe_slug, recipe)
-        lines.append("PUT OK" if ok else "WARN: PUT failed — check Mealie logs")
-        lines.append("\n=== Done ===")
+            if not url:
+                lines.append("  SKIP: no url in config")
+                failed += 1
+                continue
+
+            # 1. Import
+            try:
+                resp = await client.post("/api/recipes/create/url", json={"url": url})
+                resp.raise_for_status()
+                data = resp.json()
+                slug = data if isinstance(data, str) else (data or {}).get("slug") or (data or {}).get("id", "")
+            except Exception as exc:
+                lines.append(f"  FAILED (import): {exc}")
+                failed += 1
+                continue
+
+            if not slug:
+                lines.append("  FAILED: import returned no slug")
+                failed += 1
+                continue
+
+            lines.append(f"  slug: {slug}")
+
+            # 2. Cleanup — resolve foods and units, get referenceIds/step IDs
+            try:
+                cleanup_report = await cleanup_recipe_impl(client, slug)
+                for line in cleanup_report.splitlines():
+                    lines.append(f"  {line}")
+            except Exception as exc:
+                lines.append(f"  WARN (cleanup failed): {exc}")
+
+            # 3. Enrich — tags, categories, step linking, ingredient fixes
+            if any(x is not None for x in [tags, categories, step_map, fixes]):
+                enrich_report = await _enrich_recipe_impl(
+                    client, slug,
+                    step_ingredient_map=step_map,
+                    tags=tags,
+                    categories=categories,
+                    ingredient_fixes=fixes,
+                )
+                for line in enrich_report.splitlines():
+                    lines.append(f"  {line}")
+
+            imported += 1
+
+        lines += ["", f"=== Summary: {imported} imported, {failed} failed ==="]
         return "\n".join(lines)
 
     @mcp.tool()

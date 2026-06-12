@@ -27,6 +27,8 @@ REQUIRED_ENDPOINTS: list[tuple[str, str]] = [
     ("get",    "/api/groups/labels"),
     ("get",    "/api/foods/{item_id}"),
     ("put",    "/api/foods/{item_id}"),
+    # get_import_queue_report — test-scrape without creating a recipe
+    ("post",   "/api/recipes/test-scrape-url"),
 ]
 
 

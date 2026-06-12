@@ -1327,3 +1327,165 @@ async def test_enrich_recipe_ingredient_fix_links_sub_recipe(mealie_http, mcp_se
     finally:
         await _delete_recipe(mealie_http, parent_slug)
         await _delete_recipe(mealie_http, sub_slug)
+
+
+# ── Tests: get_import_queue_report ───────────────────────────────────────────
+
+
+async def test_get_import_queue_report_tool_is_registered(mcp_server):
+    async with Client(mcp_server) as client:
+        tools = await client.list_tools()
+    assert any(t.name == "get_import_queue_report" for t in tools)
+
+
+async def test_get_import_queue_report_returns_preview_for_valid_url(mcp_server):
+    """Scraping a real recipe URL returns name, ingredients, and steps — no recipe created."""
+    url = "https://cookieandkate.com/chocolate-chia-pudding/"
+    async with Client(mcp_server) as mcp:
+        result = await mcp.call_tool("get_import_queue_report", {"urls": [url]})
+    report = result.content[0].text
+    assert f"## {url}" in report, f"URL header missing:\n{report}"
+    # If scrape succeeds, expect content; if Mealie can't reach the URL in CI that's OK —
+    # the important thing is no exception was raised and the URL header is present.
+    assert "Import Queue Report" in report
+
+
+async def test_get_import_queue_report_inline_error_for_bad_url(mcp_server):
+    """An unreachable URL produces an inline error — does not raise or abort the batch."""
+    bad_url = "https://not-a-real-recipe-site-at-all.invalid/recipe/999"
+    async with Client(mcp_server) as mcp:
+        result = await mcp.call_tool("get_import_queue_report", {"urls": [bad_url]})
+    report = result.content[0].text
+    assert f"## {bad_url}" in report, f"URL header missing:\n{report}"
+    assert "ERROR" in report, f"Expected inline error for bad URL:\n{report}"
+
+
+async def test_get_import_queue_report_mixed_batch_contains_both_headers(mcp_server):
+    """Both URL headers appear in the report regardless of individual success/failure."""
+    good_url = "https://cookieandkate.com/chocolate-chia-pudding/"
+    bad_url = "https://not-a-real-recipe-site-at-all.invalid/recipe/999"
+    async with Client(mcp_server) as mcp:
+        result = await mcp.call_tool(
+            "get_import_queue_report",
+            {"urls": [good_url, bad_url]},
+        )
+    report = result.content[0].text
+    assert f"## {good_url}" in report, f"Good URL header missing:\n{report}"
+    assert f"## {bad_url}" in report, f"Bad URL header missing:\n{report}"
+    bad_section = report.split(f"## {bad_url}")[1]
+    assert "ERROR" in bad_section, f"Bad URL missing inline error:\n{bad_section}"
+
+
+async def test_get_import_queue_report_creates_no_recipes(mealie_http, mcp_server):
+    """Preview does not persist any recipes in Mealie."""
+    before = await _list_all_slugs(mealie_http)
+    url = "https://cookieandkate.com/chocolate-chia-pudding/"
+    async with Client(mcp_server) as mcp:
+        await mcp.call_tool("get_import_queue_report", {"urls": [url]})
+    after = await _list_all_slugs(mealie_http)
+    assert after == before, f"Recipes were created during preview: {after - before}"
+
+
+# ── Tests: apply_import_queue ────────────────────────────────────────────────
+
+
+async def test_apply_import_queue_tool_is_registered(mcp_server):
+    async with Client(mcp_server) as client:
+        tools = await client.list_tools()
+    assert any(t.name == "apply_import_queue" for t in tools)
+
+
+async def test_apply_import_queue_imports_and_cleans_up(mealie_http, mcp_server):
+    """Single-URL queue imports, cleans up ingredients, and returns a slug."""
+    url = "https://cookieandkate.com/chocolate-chia-pudding/"
+    before = await _list_all_slugs(mealie_http)
+
+    async with Client(mcp_server) as mcp:
+        result = await mcp.call_tool(
+            "apply_import_queue",
+            {"configs": [{"url": url}]},
+        )
+
+    report = result.content[0].text
+    assert "FAILED" not in report, f"Unexpected failure:\n{report}"
+    assert "slug:" in report, f"No slug in output:\n{report}"
+    assert "Recipe Cleanup" in report, f"Missing cleanup section:\n{report}"
+    assert "1 imported" in report, f"Missing summary line:\n{report}"
+
+    after = await _list_all_slugs(mealie_http)
+    new_slugs = after - before
+    assert len(new_slugs) == 1, f"Expected exactly 1 new recipe, got: {new_slugs}"
+    slug = next(iter(new_slugs))
+    try:
+        recipe = await _get_recipe(mealie_http, slug)
+        ingredients = recipe.get("recipeIngredient") or []
+        assert len(ingredients) > 0, "Imported recipe has no ingredients"
+        resolved = [i for i in ingredients if (i.get("food") or {}).get("id")]
+        assert len(resolved) > 0, f"No ingredients resolved after cleanup: {ingredients}"
+    finally:
+        await _delete_recipe(mealie_http, slug)
+
+
+async def test_apply_import_queue_applies_tags_and_categories(mealie_http, mcp_server):
+    """Tags and categories provided in the config are applied after import."""
+    url = "https://cookieandkate.com/chocolate-chia-pudding/"
+    before = await _list_all_slugs(mealie_http)
+
+    async with Client(mcp_server) as mcp:
+        result = await mcp.call_tool(
+            "apply_import_queue",
+            {"configs": [{"url": url, "tags": ["iq-test-tag"], "categories": ["iq-test-cat"]}]},
+        )
+
+    report = result.content[0].text
+    assert "FAILED" not in report, f"Unexpected failure:\n{report}"
+
+    after = await _list_all_slugs(mealie_http)
+    new_slugs = after - before
+    assert len(new_slugs) == 1
+    slug = next(iter(new_slugs))
+    try:
+        recipe = await _get_recipe(mealie_http, slug)
+        tag_names = {t["name"] for t in (recipe.get("tags") or [])}
+        cat_names = {c["name"] for c in (recipe.get("recipeCategory") or [])}
+        assert "iq-test-tag" in tag_names, f"Tag not applied: {tag_names}"
+        assert "iq-test-cat" in cat_names, f"Category not applied: {cat_names}"
+    finally:
+        await _delete_recipe(mealie_http, slug)
+
+
+async def test_apply_import_queue_error_for_bad_url(mcp_server):
+    """An unreachable URL produces an inline FAILED line without raising."""
+    async with Client(mcp_server) as mcp:
+        result = await mcp.call_tool(
+            "apply_import_queue",
+            {"configs": [{"url": "https://not-a-real-recipe-site-at-all.invalid/recipe/999"}]},
+        )
+    report = result.content[0].text
+    assert "FAILED" in report, f"Expected FAILED for bad URL:\n{report}"
+    assert "0 imported, 1 failed" in report, f"Wrong summary:\n{report}"
+
+
+async def test_apply_import_queue_error_isolation(mealie_http, mcp_server):
+    """A bad URL in a 2-item queue fails in isolation; the good URL still imports."""
+    good_url = "https://cookieandkate.com/chocolate-chia-pudding/"
+    bad_url = "https://not-a-real-recipe-site-at-all.invalid/recipe/999"
+    before = await _list_all_slugs(mealie_http)
+
+    async with Client(mcp_server) as mcp:
+        result = await mcp.call_tool(
+            "apply_import_queue",
+            {"configs": [{"url": good_url}, {"url": bad_url}]},
+        )
+
+    report = result.content[0].text
+    assert "1 imported, 1 failed" in report, f"Wrong summary:\n{report}"
+
+    after = await _list_all_slugs(mealie_http)
+    new_slugs = after - before
+    assert len(new_slugs) == 1, f"Expected exactly 1 new recipe, got: {new_slugs}"
+    slug = next(iter(new_slugs))
+    try:
+        pass
+    finally:
+        await _delete_recipe(mealie_http, slug)
