@@ -28,6 +28,17 @@ INCLUDE_PATTERNS: list[str] = [
 
 def build_route_maps() -> list[RouteMap]:
     """Curated include-list, then exclude the rest of the Mealie API."""
-    maps = [RouteMap(pattern=p, mcp_type=MCPType.TOOL) for p in INCLUDE_PATTERNS]
+    maps = [
+        # Raw PUT on recipes wipes every field not included in the payload
+        # (tags, categories, recipeYield, etc.). Exclude both the bulk PUT
+        # (/api/recipes) and the single-recipe PUT (/api/recipes/{slug}) so
+        # LLMs use the safe composed tools (update_recipe, enrich_recipe, …).
+        RouteMap(
+            methods=["PUT"],
+            pattern=r"^/api/recipes(/[^/]+)?$",
+            mcp_type=MCPType.EXCLUDE,
+        ),
+    ]
+    maps += [RouteMap(pattern=p, mcp_type=MCPType.TOOL) for p in INCLUDE_PATTERNS]
     maps.append(RouteMap(pattern=r".*", mcp_type=MCPType.EXCLUDE))
     return maps

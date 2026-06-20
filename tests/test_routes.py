@@ -29,6 +29,8 @@ REQUIRED_ENDPOINTS: list[tuple[str, str]] = [
     ("put",    "/api/foods/{item_id}"),
     # get_import_queue_report — test-scrape without creating a recipe
     ("post",   "/api/recipes/test-scrape-url"),
+    # upload_recipe_image — base64 bridge for recipe images
+    ("post",   "/api/recipes/{slug}/image"),
 ]
 
 

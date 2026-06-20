@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import uuid
 from typing import Any
 
@@ -1295,3 +1296,50 @@ def register_recipe_tools(mcp: Any, client: httpx.AsyncClient) -> None:
         lines.append("PUT OK" if ok else "WARN: PUT failed — check Mealie logs")
         lines.append("\n=== Done ===")
         return "\n".join(lines)
+
+    @mcp.tool()
+    async def upload_recipe_image(
+        recipe_slug: str,
+        image_b64: str,
+        extension: str = "jpg",
+    ) -> str:
+        """
+        Upload a base64-encoded image as the primary recipe image.
+
+        MCP transport (JSON over stdio) cannot carry binary, so this tool
+        accepts the image as a base64 string and decodes it server-side before
+        sending it to Mealie as multipart form data.
+
+        Args:
+            recipe_slug: The recipe slug or UUID.
+            image_b64:   Base64-encoded image bytes (standard or URL-safe
+                         encoding; padding is optional).
+            extension:   Image format extension — "jpg" (default) or "png".
+
+        Returns:
+            Plain-text confirmation or an error message.
+        """
+        try:
+            recipe = await get_recipe(client, recipe_slug)
+        except Exception as exc:
+            return f"ERROR: could not fetch recipe '{recipe_slug}': {exc}"
+
+        try:
+            image_bytes = base64.b64decode(image_b64 + "==")
+        except Exception as exc:
+            return f"ERROR: invalid base64 data: {exc}"
+
+        ext = extension.lower().lstrip(".")
+        mime = "image/png" if ext == "png" else "image/jpeg"
+        slug = recipe.get("slug", recipe_slug)
+        try:
+            r = await client.post(
+                f"/api/recipes/{slug}/image",
+                files={"image": (f"recipe.{ext}", image_bytes, mime)},
+                data={"extension": ext},
+            )
+            if r.is_success:
+                return f"Image uploaded for '{recipe.get('name', recipe_slug)}'"
+            return f"ERROR: upload failed (HTTP {r.status_code}): {r.text[:300]}"
+        except Exception as exc:
+            return f"ERROR: upload request failed: {exc}"

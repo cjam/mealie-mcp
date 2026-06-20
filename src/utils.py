@@ -249,6 +249,12 @@ async def find_or_create_unit(
 
 # ── Recipe helpers ─────────────────────────────────────────────────────────────
 
+# In-process cache: slug/uuid → uuid. UUIDs are stable; slugs only change on
+# rename, which is rare within a single MCP session. Avoids extra GETs in
+# planning and shopping tools that resolve the same recipes repeatedly.
+_id_cache: dict[str, str] = {}
+
+
 async def get_recipe(client: httpx.AsyncClient, slug: str) -> dict:
     resp = await client.get(f"/api/recipes/{slug}")
     resp.raise_for_status()
@@ -257,8 +263,13 @@ async def get_recipe(client: httpx.AsyncClient, slug: str) -> dict:
 
 async def resolve_recipe_id(client: httpx.AsyncClient, slug_or_id: str) -> str:
     """Return the UUID for a recipe given its slug or UUID."""
+    if slug_or_id in _id_cache:
+        return _id_cache[slug_or_id]
     recipe = await get_recipe(client, slug_or_id)
-    return recipe["id"]
+    recipe_id = recipe["id"]
+    _id_cache[recipe_id] = recipe_id
+    _id_cache[recipe.get("slug", slug_or_id)] = recipe_id
+    return recipe_id
 
 
 async def put_recipe(client: httpx.AsyncClient, slug: str, recipe: dict) -> bool:
