@@ -599,18 +599,26 @@ def register_recipe_tools(mcp: Any, client: httpx.AsyncClient) -> None:
         if not isinstance(slug, str):
             slug = (slug or {}).get("slug") or (slug or {}).get("id", "")
 
-        if description or servings is not None:
-            try:
-                recipe = await get_recipe(client, slug)
-                if description:
-                    recipe["description"] = description
-                if servings is not None:
-                    recipe["recipeYield"] = str(servings)
-                await put_recipe(client, slug, recipe)
-            except Exception:
-                pass
+        # Always re-fetch to detect name/slug changes Mealie makes on dedup
+        # (e.g. "My Recipe" → "My Recipe (1)" when slug already exists).
+        actual_name = name
+        try:
+            created = await get_recipe(client, slug)
+            actual_name = created.get("name", name)
+            slug = created.get("slug", slug)
+            if description:
+                created["description"] = description
+            if servings is not None:
+                created["recipeYield"] = str(servings)
+            if description or servings is not None:
+                await put_recipe(client, slug, created)
+        except Exception:
+            pass
 
-        return f"Created recipe '{name}'\nSlug: {slug}"
+        result = f"Created recipe '{actual_name}'\nSlug: {slug}"
+        if actual_name != name:
+            result += f"\nNote: Mealie renamed from '{name}' to avoid a slug conflict."
+        return result
 
     @mcp.tool()
     async def update_recipe(
@@ -894,7 +902,7 @@ def register_recipe_tools(mcp: Any, client: httpx.AsyncClient) -> None:
             )
 
         try:
-            params: list[tuple[str, str | int]] = [("foods", fid) for fid in resolved_ids]
+            params: list[tuple[str, Any]] = [("foods", fid) for fid in resolved_ids]
             params.append(("limit", limit))
             r = await client.get(_SUGGEST_PATH, params=params)
             r.raise_for_status()

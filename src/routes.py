@@ -17,7 +17,6 @@ INCLUDE_PATTERNS: list[str] = [
     r"^/api/recipes",                     # search, get, create, update recipes
     r"^/api/households/mealplans",        # meal plans
     r"^/api/households/shopping/lists",   # shopping lists (CRUD + recipe expansion)
-    r"^/api/households/shopping/items",   # shopping list items
     r"^/api/organizers/categories",       # recipe categories
     r"^/api/organizers/tags",             # recipe tags
     r"^/api/foods",                       # food database

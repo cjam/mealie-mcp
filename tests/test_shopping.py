@@ -275,3 +275,262 @@ async def test_normalize_single_item_foods_untouched(mcp_server, mealie_http):
 
     finally:
         await _delete_shopping_list(mealie_http, list_id)
+
+
+# ── get_shopping_list_items tests ─────────────────────────────────────────────
+
+async def test_get_shopping_list_items_registered(mcp_server):
+    async with Client(mcp_server) as client:
+        tools = await client.list_tools()
+    assert "get_shopping_list_items" in [t.name for t in tools]
+
+
+async def test_get_shopping_list_items_compact_table(mcp_server, mealie_http):
+    """Returns a compact line per item — id, food, qty, unit."""
+    food = await _get_or_create_food(mealie_http, "Test Broccoli Items")
+    cup = await _get_or_create_unit(mealie_http, "cup", "c")
+    list_id = await _create_shopping_list(mealie_http, "Test Items Table")
+    try:
+        await _add_item(mealie_http, list_id, food, cup, 2.0)
+        async with Client(mcp_server) as mcp:
+            result = await mcp.call_tool("get_shopping_list_items", {"list_id": list_id})
+        text = result.content[0].text
+        assert "Test Broccoli Items" in text
+        assert "1 item" in text
+    finally:
+        await _delete_shopping_list(mealie_http, list_id)
+
+
+async def test_get_shopping_list_items_empty(mcp_server, mealie_http):
+    """Empty list reports zero items without error."""
+    list_id = await _create_shopping_list(mealie_http, "Test Items Empty")
+    try:
+        async with Client(mcp_server) as mcp:
+            result = await mcp.call_tool("get_shopping_list_items", {"list_id": list_id})
+        text = result.content[0].text
+        assert "0 item" in text or "(empty)" in text
+    finally:
+        await _delete_shopping_list(mealie_http, list_id)
+
+
+# ── adjust_shopping_list_items tests ─────────────────────────────────────────
+
+async def test_adjust_shopping_list_items_registered(mcp_server):
+    async with Client(mcp_server) as client:
+        tools = await client.list_tools()
+    assert "adjust_shopping_list_items" in [t.name for t in tools]
+
+
+async def test_adjust_adds_item_by_food_name(mcp_server, mealie_http):
+    """add entry creates a new shopping list item resolved from food name."""
+    list_id = await _create_shopping_list(mealie_http, "Test Adjust Add")
+    try:
+        async with Client(mcp_server) as mcp:
+            result = await mcp.call_tool(
+                "adjust_shopping_list_items",
+                {
+                    "list_id": list_id,
+                    "add": [{"food": "Test Spinach Adjust", "quantity": 1.5, "unit": "lb"}],
+                },
+            )
+        text = result.content[0].text
+        assert "ADDED" in text
+        items = await _list_items(mealie_http, list_id)
+        assert len(items) == 1
+        assert abs(float(items[0]["quantity"]) - 1.5) < 0.01
+    finally:
+        await _delete_shopping_list(mealie_http, list_id)
+
+
+async def test_adjust_updates_item_by_food_name(mcp_server, mealie_http):
+    """update entry changes quantity on an existing item identified by food name."""
+    food = await _get_or_create_food(mealie_http, "Test Pepper Adjust")
+    lb = await _get_or_create_unit(mealie_http, "pound", "lb")
+    list_id = await _create_shopping_list(mealie_http, "Test Adjust Update")
+    try:
+        await _add_item(mealie_http, list_id, food, lb, 1.0)
+        async with Client(mcp_server) as mcp:
+            result = await mcp.call_tool(
+                "adjust_shopping_list_items",
+                {
+                    "list_id": list_id,
+                    "update": [{"food": "Test Pepper Adjust", "quantity": 2.5}],
+                },
+            )
+        text = result.content[0].text
+        assert "UPDATED" in text
+        items = await _list_items(mealie_http, list_id)
+        assert len(items) == 1
+        assert abs(float(items[0]["quantity"]) - 2.5) < 0.01
+    finally:
+        await _delete_shopping_list(mealie_http, list_id)
+
+
+async def test_adjust_removes_item_by_food_name(mcp_server, mealie_http):
+    """remove entry deletes all unchecked items matching the food name."""
+    food = await _get_or_create_food(mealie_http, "Test Tomato Adjust")
+    cup = await _get_or_create_unit(mealie_http, "cup", "c")
+    list_id = await _create_shopping_list(mealie_http, "Test Adjust Remove")
+    try:
+        await _add_item(mealie_http, list_id, food, cup, 3.0)
+        assert len(await _list_items(mealie_http, list_id)) == 1
+
+        async with Client(mcp_server) as mcp:
+            result = await mcp.call_tool(
+                "adjust_shopping_list_items",
+                {"list_id": list_id, "remove": ["Test Tomato Adjust"]},
+            )
+        text = result.content[0].text
+        assert "REMOVE" in text
+        assert len(await _list_items(mealie_http, list_id)) == 0
+    finally:
+        await _delete_shopping_list(mealie_http, list_id)
+
+
+async def test_adjust_mixed_operations(mcp_server, mealie_http):
+    """add + update + remove all succeed in one call."""
+    food_keep = await _get_or_create_food(mealie_http, "Test Zucchini Adjust")
+    food_drop = await _get_or_create_food(mealie_http, "Test Eggplant Adjust")
+    cup = await _get_or_create_unit(mealie_http, "cup", "c")
+    list_id = await _create_shopping_list(mealie_http, "Test Adjust Mixed")
+    try:
+        await _add_item(mealie_http, list_id, food_keep, cup, 1.0)
+        await _add_item(mealie_http, list_id, food_drop, cup, 2.0)
+
+        async with Client(mcp_server) as mcp:
+            result = await mcp.call_tool(
+                "adjust_shopping_list_items",
+                {
+                    "list_id": list_id,
+                    "add": [{"food": "Test Kale Adjust", "quantity": 1.0}],
+                    "update": [{"food": "Test Zucchini Adjust", "quantity": 3.0}],
+                    "remove": ["Test Eggplant Adjust"],
+                },
+            )
+        text = result.content[0].text
+        assert "ADDED" in text
+        assert "UPDATED" in text
+        assert "REMOVE" in text
+
+        items = await _list_items(mealie_http, list_id)
+        food_names = {(i.get("food") or {}).get("name", "") for i in items}
+        assert "Test Eggplant Adjust" not in food_names
+        keep_item = next(i for i in items if (i.get("food") or {}).get("name") == "Test Zucchini Adjust")
+        assert abs(float(keep_item["quantity"]) - 3.0) < 0.01
+    finally:
+        await _delete_shopping_list(mealie_http, list_id)
+
+
+# ── optional ingredient filtering tests ──────────────────────────────────────
+
+async def _create_recipe_with_ingredients(
+    client: httpx.AsyncClient,
+    name: str,
+    ingredients: list[dict],
+) -> dict:
+    """Create a recipe, set ingredients via PUT, and return the recipe dict."""
+    r = await client.post("/api/recipes", json={"name": name})
+    r.raise_for_status()
+    slug = r.json()
+    r2 = await client.get(f"/api/recipes/{slug}")
+    r2.raise_for_status()
+    recipe = r2.json()
+    recipe["recipeIngredient"] = ingredients
+    r3 = await client.put(f"/api/recipes/{slug}", json=recipe)
+    r3.raise_for_status()
+    # Re-fetch to get authoritative state including IDs
+    r4 = await client.get(f"/api/recipes/{slug}")
+    r4.raise_for_status()
+    return r4.json()
+
+
+async def test_replace_shopping_list_skips_optional_by_note(mcp_server, mealie_http):
+    """Ingredients with 'optional' in the note are excluded by default."""
+    food_req = await _get_or_create_food(mealie_http, "Test Required Chicken")
+    food_opt = await _get_or_create_food(mealie_http, "Test Optional Shrimp")
+
+    import uuid as _uuid
+    ingredients = [
+        {
+            "referenceId": str(_uuid.uuid4()),
+            "food": food_req,
+            "foodId": food_req["id"],
+            "quantity": 1.0,
+            "note": "",
+            "title": "",
+        },
+        {
+            "referenceId": str(_uuid.uuid4()),
+            "food": food_opt,
+            "foodId": food_opt["id"],
+            "quantity": 1.0,
+            "note": "optional — or use tofu",
+            "title": "",
+        },
+    ]
+    recipe = await _create_recipe_with_ingredients(
+        mealie_http, "Test Optional Note Recipe", ingredients
+    )
+    list_id = await _create_shopping_list(mealie_http, "Test Optional Note List")
+    try:
+        async with Client(mcp_server) as mcp:
+            result = await mcp.call_tool(
+                "replace_shopping_list_from_recipes",
+                {"list_id": list_id, "recipe_ids": [recipe["slug"]]},
+            )
+        text = result.content[0].text
+        assert "optional" in text.lower()
+
+        items = await _list_items(mealie_http, list_id)
+        food_ids = {(i.get("food") or {}).get("id") for i in items}
+        assert food_req["id"] in food_ids, "required ingredient should remain"
+        assert food_opt["id"] not in food_ids, "optional ingredient should be removed"
+    finally:
+        await _delete_recipe(mealie_http, recipe["slug"])
+        await _delete_shopping_list(mealie_http, list_id)
+
+
+async def test_replace_shopping_list_include_optional_flag(mcp_server, mealie_http):
+    """include_optional=True keeps all ingredients including optional ones."""
+    food_req = await _get_or_create_food(mealie_http, "Test Req Beef Opt Flag")
+    food_opt = await _get_or_create_food(mealie_http, "Test Opt Bacon Opt Flag")
+
+    import uuid as _uuid
+    ingredients = [
+        {
+            "referenceId": str(_uuid.uuid4()),
+            "food": food_req,
+            "foodId": food_req["id"],
+            "quantity": 1.0,
+            "note": "",
+            "title": "",
+        },
+        {
+            "referenceId": str(_uuid.uuid4()),
+            "food": food_opt,
+            "foodId": food_opt["id"],
+            "quantity": 1.0,
+            "note": "optional",
+            "title": "",
+        },
+    ]
+    recipe = await _create_recipe_with_ingredients(
+        mealie_http, "Test Include Optional Recipe", ingredients
+    )
+    list_id = await _create_shopping_list(mealie_http, "Test Include Optional List")
+    try:
+        async with Client(mcp_server) as mcp:
+            result = await mcp.call_tool(
+                "replace_shopping_list_from_recipes",
+                {
+                    "list_id": list_id,
+                    "recipe_ids": [recipe["slug"]],
+                    "include_optional": True,
+                },
+            )
+        items = await _list_items(mealie_http, list_id)
+        food_ids = {(i.get("food") or {}).get("id") for i in items}
+        assert food_opt["id"] in food_ids, "optional ingredient kept when include_optional=True"
+    finally:
+        await _delete_recipe(mealie_http, recipe["slug"])
+        await _delete_shopping_list(mealie_http, list_id)

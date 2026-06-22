@@ -2,11 +2,25 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 import httpx
 
-from utils import normalize_unit, resolve_recipe_id, unit_family_and_factor
+from utils import (
+    find_or_create_food,
+    find_or_create_unit,
+    get_all,
+    get_recipe,
+    normalize_food,
+    normalize_unit,
+    resolve_recipe_id,
+    unit_family_and_factor,
+)
+
+_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE
+)
 
 
 def register_shopping_tools(mcp: Any, client: httpx.AsyncClient) -> None:
@@ -16,6 +30,7 @@ def register_shopping_tools(mcp: Any, client: httpx.AsyncClient) -> None:
         list_id: str,
         recipe_ids: list[str],
         scale: float = 1.0,
+        include_optional: bool = False,
     ) -> str:
         """
         Replace all items in a shopping list with the ingredients from a set of recipes.
@@ -26,11 +41,19 @@ def register_shopping_tools(mcp: Any, client: httpx.AsyncClient) -> None:
           3. For each recipe, call Mealie's ingredient-expansion endpoint
              (POST /api/households/shopping/lists/{id}/recipe/{recipe_id}) so Mealie
              handles unit conversion, quantity scaling, and ingredient deduplication.
+          4. Unless include_optional=True, remove any items whose ingredient was
+             marked optional — either by an "optional" note on the ingredient, or by
+             being under a section title that starts with "Optional".
+
+        When the same food is required in one recipe and optional in another, it is
+        kept (required wins). This makes it safe to pass several recipes at once.
 
         Args:
-            list_id:    UUID of the shopping list to replace.
-            recipe_ids: Ordered list of recipe UUIDs or slugs whose ingredients to add.
-            scale:      Serving multiplier applied to every recipe (default 1.0).
+            list_id:          UUID of the shopping list to replace.
+            recipe_ids:       Ordered list of recipe UUIDs or slugs whose ingredients to add.
+            scale:            Serving multiplier applied to every recipe (default 1.0).
+            include_optional: When True, all ingredients are added regardless of their
+                              optional status. Default False skips optional ingredients.
 
         Returns:
             Plain-text summary of how many items were cleared and how many recipes
@@ -61,6 +84,34 @@ def register_shopping_tools(mcp: Any, client: httpx.AsyncClient) -> None:
                 )
         lines.append(f"  Cleared {deleted}/{len(all_items)} existing items")
 
+        # Pre-collect optional/required food IDs so we can filter after adding.
+        truly_optional: set[str] = set()
+        if not include_optional:
+            required_food_ids: set[str] = set()
+            optional_food_ids: set[str] = set()
+            for slug_or_id in recipe_ids:
+                try:
+                    recipe_data = await get_recipe(client, slug_or_id)
+                except Exception:
+                    continue
+                in_optional_section = False
+                for ing in recipe_data.get("recipeIngredient") or []:
+                    title = ing.get("title") or ""
+                    if title:
+                        in_optional_section = title.lower().startswith("optional")
+                        continue
+                    food_id = (ing.get("food") or {}).get("id")
+                    if not food_id:
+                        continue
+                    note = (ing.get("note") or "").lower()
+                    is_opt = in_optional_section or "optional" in note
+                    if is_opt:
+                        optional_food_ids.add(food_id)
+                    else:
+                        required_food_ids.add(food_id)
+            # Required in any recipe trumps optional in any recipe
+            truly_optional = optional_food_ids - required_food_ids
+
         added = 0
         params = {"recipeIncrements": scale} if scale != 1.0 else {}
         for slug_or_id in recipe_ids:
@@ -78,6 +129,285 @@ def register_shopping_tools(mcp: Any, client: httpx.AsyncClient) -> None:
             else:
                 lines.append(f"  WARN: add recipe {slug_or_id} failed — HTTP {r.status_code}")
         lines.append(f"  Added {added}/{len(recipe_ids)} recipes")
+
+        if truly_optional:
+            final_resp = await client.get(f"/api/households/shopping/lists/{list_id}")
+            if final_resp.is_success:
+                final_items = final_resp.json().get("listItems") or []
+                opt_ids = [
+                    i["id"] for i in final_items
+                    if (i.get("food") or {}).get("id") in truly_optional
+                ]
+                if opt_ids:
+                    del_r = await client.request(
+                        "DELETE", "/api/households/shopping/items", params={"ids": opt_ids}
+                    )
+                    if del_r.is_success:
+                        lines.append(f"  Removed {len(opt_ids)} optional ingredient(s)")
+                    else:
+                        lines.append(
+                            f"  WARN: could not remove optional items — HTTP {del_r.status_code}"
+                        )
+
+        lines.append("\n=== Done ===")
+        return "\n".join(lines)
+
+    @mcp.tool()
+    async def get_shopping_list_items(list_id: str) -> str:
+        """
+        Return a compact item table for a shopping list.
+
+        Much lighter than fetching the full list detail — returns only id, food
+        name, quantity, unit, note, and checked status for each item. Use this to
+        verify list state, look up item UUIDs for targeted edits, or confirm an
+        adjust_shopping_list_items call took effect.
+
+        Args:
+            list_id: UUID of the shopping list.
+
+        Returns:
+            Plain-text table: one line per item, id · checked · food · qty · unit.
+        """
+        resp = await client.get(f"/api/households/shopping/lists/{list_id}")
+        resp.raise_for_status()
+        data = resp.json()
+        items: list[dict] = data.get("listItems") or []
+        list_name = data.get("name", list_id)
+
+        lines = [f"=== Shopping List: {list_name} ({len(items)} item(s)) ===", ""]
+        if not items:
+            lines.append("  (empty)")
+            return "\n".join(lines)
+
+        for item in items:
+            item_id = item.get("id", "?")
+            food_name = (item.get("food") or {}).get("name") or item.get("note") or "(no food)"
+            qty = item.get("quantity")
+            unit_name = (item.get("unit") or {}).get("name") or ""
+            note = item.get("note") or ""
+            checked = "✓" if item.get("checked") else "○"
+            qty_str = f"{qty} {unit_name}".strip() if qty is not None else ""
+            display = f"{checked} {food_name}"
+            if qty_str:
+                display += f"  {qty_str}"
+            if note and note != food_name:
+                display += f"  ({note})"
+            lines.append(f"  {item_id}  {display}")
+
+        return "\n".join(lines)
+
+    @mcp.tool()
+    async def adjust_shopping_list_items(
+        list_id: str,
+        add: list[dict] | None = None,
+        update: list[dict] | None = None,
+        remove: list[str] | None = None,
+    ) -> str:
+        """
+        Add, update, or remove items on a shopping list in one call.
+
+        All operations accept food and unit names — ID resolution and food/unit
+        creation are handled internally, matching the same pattern as the recipe
+        ingredient tools. Items can also be identified by UUID for precise targeting.
+
+        add entries (dict):
+          food      (str, required)  food name — created in Mealie if missing
+          quantity  (float)          optional
+          unit      (str)            unit name — created if missing; optional
+          note      (str)            free-text note; optional
+
+        update entries (dict) — item identified by food name OR id:
+          food      (str)    first unchecked item on the list whose food matches this name
+          id        (str)    specific item UUID (takes precedence over food)
+          quantity  (float)  new quantity; optional
+          unit      (str)    new unit name; optional
+          note      (str)    new note; optional
+
+        remove entries (str): food name — removes all unchecked matching items;
+          or item UUID — removes that specific item.
+
+        Args:
+            list_id: UUID of the shopping list to modify.
+            add:     Items to add.
+            update:  Items to update in place.
+            remove:  Food names or item UUIDs to remove.
+
+        Returns:
+            Plain-text report of every operation and its outcome.
+        """
+        lines = ["=== Adjust Shopping List Items ===", ""]
+
+        # Fetch existing items once for update/remove lookups
+        existing_items: list[dict] = []
+        id_to_item: dict[str, dict] = {}
+        food_name_to_items: dict[str, list[dict]] = {}
+        if update or remove:
+            r = await client.get(f"/api/households/shopping/lists/{list_id}")
+            r.raise_for_status()
+            existing_items = r.json().get("listItems") or []
+            for item in existing_items:
+                iid = item.get("id")
+                if iid:
+                    id_to_item[iid] = item
+                fname = (item.get("food") or {}).get("name", "")
+                if fname:
+                    food_name_to_items.setdefault(fname.lower(), []).append(item)
+
+        food_map: dict[str, dict] = {}
+        unit_map: dict[str, dict] = {}
+
+        async def _ensure_foods() -> None:
+            if not food_map:
+                foods = await get_all(client, "/api/foods")
+                food_map.update({normalize_food(f["name"]): f for f in foods})
+
+        async def _ensure_units() -> None:
+            if not unit_map:
+                units = await get_all(client, "/api/units")
+                unit_map.update({normalize_unit(u["name"]): u for u in units})
+
+        # ── ADD ───────────────────────────────────────────────────────────────
+        if add:
+            lines.append("## Add")
+            await _ensure_foods()
+            for entry in add:
+                food_name = entry.get("food", "")
+                unit_name = entry.get("unit", "")
+                quantity = entry.get("quantity")
+                note = entry.get("note", "")
+
+                if not food_name and not note:
+                    lines.append(f"  WARN: skipping entry with no food or note: {entry}")
+                    continue
+
+                payload: dict = {
+                    "shoppingListId": list_id,
+                    "quantity": quantity,
+                    "note": note,
+                    "checked": False,
+                }
+                label_parts: list[str] = []
+
+                if food_name:
+                    food, action = await find_or_create_food(client, food_name, food_map)
+                    if food is None:
+                        lines.append(f"  FAILED: could not find or create food '{food_name}'")
+                        continue
+                    payload["foodId"] = food["id"]
+                    label_parts.append(f"'{food['name']}' [{action}]")
+
+                if unit_name:
+                    await _ensure_units()
+                    unit, u_action = await find_or_create_unit(client, unit_name, unit_map)
+                    if unit:
+                        payload["unitId"] = unit["id"]
+                        label_parts.append(f"unit '{unit['name']}' [{u_action}]")
+                    else:
+                        label_parts.append(f"unit '{unit_name}' [FAILED]")
+
+                if quantity is not None:
+                    label_parts.append(f"qty={quantity}")
+
+                try:
+                    r = await client.post("/api/households/shopping/items", json=payload)
+                    if r.is_success:
+                        lines.append(f"  ADDED  {' | '.join(label_parts)}")
+                    else:
+                        lines.append(f"  FAILED (HTTP {r.status_code})  {' | '.join(label_parts)}")
+                except Exception as exc:
+                    lines.append(f"  ERROR  {' | '.join(label_parts)}: {exc}")
+            lines.append("")
+
+        # ── UPDATE ────────────────────────────────────────────────────────────
+        if update:
+            lines.append("## Update")
+            await _ensure_units()
+            for entry in update:
+                entry_id = entry.get("id", "")
+                food_name = entry.get("food", "")
+
+                target: dict | None = None
+                if entry_id:
+                    target = id_to_item.get(entry_id)
+                    if target is None:
+                        lines.append(f"  FAILED: item '{entry_id[:8]}…' not found on list")
+                        continue
+                elif food_name:
+                    matches = [
+                        i for i in food_name_to_items.get(food_name.lower(), [])
+                        if not i.get("checked")
+                    ]
+                    if not matches:
+                        lines.append(f"  FAILED: no unchecked item with food '{food_name}' on list")
+                        continue
+                    target = matches[0]
+                else:
+                    lines.append(f"  WARN: skipping update with no id or food: {entry}")
+                    continue
+
+                target_id = target["id"]
+                updated = dict(target)
+                label_parts = [food_name or entry_id[:8] + "…"]
+
+                if "quantity" in entry:
+                    updated["quantity"] = entry["quantity"]
+                    label_parts.append(f"qty={entry['quantity']}")
+
+                if "unit" in entry:
+                    unit, u_action = await find_or_create_unit(client, entry["unit"], unit_map)
+                    if unit:
+                        updated["unit"] = unit
+                        updated["unitId"] = unit["id"]
+                        label_parts.append(f"unit '{unit['name']}' [{u_action}]")
+                    else:
+                        label_parts.append(f"unit '{entry['unit']}' [FAILED]")
+
+                if "note" in entry:
+                    updated["note"] = entry["note"]
+
+                try:
+                    r = await client.put(
+                        f"/api/households/shopping/items/{target_id}", json=updated
+                    )
+                    if r.is_success:
+                        lines.append(f"  UPDATED  {' | '.join(label_parts)}")
+                    else:
+                        lines.append(f"  FAILED (HTTP {r.status_code})  {' | '.join(label_parts)}")
+                except Exception as exc:
+                    lines.append(f"  ERROR  {' | '.join(label_parts)}: {exc}")
+            lines.append("")
+
+        # ── REMOVE ────────────────────────────────────────────────────────────
+        if remove:
+            lines.append("## Remove")
+            ids_to_delete: list[str] = []
+            for ref in remove:
+                if _UUID_RE.match(ref) and ref in id_to_item:
+                    ids_to_delete.append(ref)
+                    food_display = (id_to_item[ref].get("food") or {}).get("name", ref[:8])
+                    lines.append(f"  REMOVE (by id)  '{food_display}'")
+                else:
+                    matches = [
+                        i for i in food_name_to_items.get(ref.lower(), [])
+                        if not i.get("checked")
+                    ]
+                    if not matches:
+                        lines.append(f"  WARN: no unchecked item matching '{ref}'")
+                    else:
+                        ids_to_delete.extend(i["id"] for i in matches)
+                        lines.append(f"  REMOVE  '{ref}' ({len(matches)} item(s))")
+
+            if ids_to_delete:
+                try:
+                    r = await client.request(
+                        "DELETE", "/api/households/shopping/items",
+                        params={"ids": ids_to_delete},
+                    )
+                    if not r.is_success:
+                        lines.append(f"  WARN: bulk delete returned HTTP {r.status_code}")
+                except Exception as exc:
+                    lines.append(f"  ERROR during delete: {exc}")
+
         lines.append("\n=== Done ===")
         return "\n".join(lines)
 
