@@ -166,6 +166,34 @@ async def test_token_forwarded_via_http_header(mealie_base_url, tokenless_settin
 
 
 @pytest.mark.asyncio
+async def test_token_forwarded_to_real_api_call(mealie_base_url, tokenless_settings):
+    """A tool call requiring Mealie auth succeeds when the token only comes from
+    the client's Authorization header, proving the middleware actually forwards it.
+
+    Unlike test_token_forwarded_via_http_header (which only lists tools — served
+    from the pre-fetched OpenAPI spec and never touches per-request auth), this
+    exercises a real Mealie API call so a disconnected TokenForwardMiddleware
+    would cause it to fail with a 401.
+    """
+    resp = httpx.post(
+        f"{mealie_base_url}/api/auth/token",
+        data={"username": "changeme@example.com", "password": "MyPassword"},
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    token = resp.json()["access_token"]
+
+    server = build_server(tokenless_settings)
+    async with run_server_async(server) as url:
+        transport = StreamableHttpTransport(url, headers={"Authorization": f"Bearer {token}"})
+        async with Client(transport) as client:
+            result = await client.call_tool("get_all_api_recipes_get", {})
+
+    assert result is not None
+
+
+@pytest.mark.asyncio
 async def test_no_token_returns_error(tokenless_settings):
     """Requests without a token should fail — Mealie rejects unauthenticated calls."""
     server = build_server(tokenless_settings)

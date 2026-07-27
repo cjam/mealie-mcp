@@ -90,6 +90,7 @@ def build_server(settings: Settings) -> FastMCP:
         name="Mealie",
         route_maps=build_route_maps(),
     )
+    mcp.add_middleware(TokenForwardMiddleware())
     register_all_tools(mcp, client)
     return mcp
 
