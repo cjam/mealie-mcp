@@ -490,6 +490,102 @@ async def test_replace_shopping_list_skips_optional_by_note(mcp_server, mealie_h
         await _delete_shopping_list(mealie_http, list_id)
 
 
+async def test_replace_shopping_list_auto_merges_cross_unit_duplicates(mcp_server, mealie_http):
+    """Same food in different units across two recipes is consolidated automatically,
+    without a separate normalize_shopping_list call."""
+    food = await _get_or_create_food(mealie_http, "Test Garlic AutoMerge")
+    # Aliases so Mealie doesn't set standardUnit and won't auto-merge at insert time.
+    tsp = await _get_or_create_unit(mealie_http, "t", "")
+    tbsp = await _get_or_create_unit(mealie_http, "tb", "")
+
+    import uuid as _uuid
+
+    def _ingredient(unit: dict, quantity: float) -> dict:
+        return {
+            "referenceId": str(_uuid.uuid4()),
+            "food": food,
+            "foodId": food["id"],
+            "unit": unit,
+            "unitId": unit["id"],
+            "quantity": quantity,
+            "note": "",
+            "title": "",
+        }
+
+    recipe_a = await _create_recipe_with_ingredients(
+        mealie_http, "Test AutoMerge Recipe A", [_ingredient(tsp, 3.0)]
+    )
+    recipe_b = await _create_recipe_with_ingredients(
+        mealie_http, "Test AutoMerge Recipe B", [_ingredient(tbsp, 1.0)]
+    )
+    list_id = await _create_shopping_list(mealie_http, "Test AutoMerge List")
+    try:
+        async with Client(mcp_server) as mcp:
+            result = await mcp.call_tool(
+                "replace_shopping_list_from_recipes",
+                {"list_id": list_id, "recipe_ids": [recipe_a["slug"], recipe_b["slug"]]},
+            )
+        text = result.content[0].text
+        assert "MERGE" in text
+        assert "Consolidated" in text
+
+        items = await _list_items(mealie_http, list_id)
+        assert len(items) == 1
+        assert abs(float(items[0]["quantity"]) - 2.0) < 0.01
+    finally:
+        await _delete_recipe(mealie_http, recipe_a["slug"])
+        await _delete_recipe(mealie_http, recipe_b["slug"])
+        await _delete_shopping_list(mealie_http, list_id)
+
+
+async def test_replace_shopping_list_merge_duplicates_false_skips_merge(mcp_server, mealie_http):
+    """merge_duplicates=False leaves cross-unit duplicates unconsolidated."""
+    food = await _get_or_create_food(mealie_http, "Test Ginger NoAutoMerge")
+    tsp = await _get_or_create_unit(mealie_http, "t", "")
+    tbsp = await _get_or_create_unit(mealie_http, "tb", "")
+
+    import uuid as _uuid
+
+    def _ingredient(unit: dict, quantity: float) -> dict:
+        return {
+            "referenceId": str(_uuid.uuid4()),
+            "food": food,
+            "foodId": food["id"],
+            "unit": unit,
+            "unitId": unit["id"],
+            "quantity": quantity,
+            "note": "",
+            "title": "",
+        }
+
+    recipe_a = await _create_recipe_with_ingredients(
+        mealie_http, "Test NoAutoMerge Recipe A", [_ingredient(tsp, 3.0)]
+    )
+    recipe_b = await _create_recipe_with_ingredients(
+        mealie_http, "Test NoAutoMerge Recipe B", [_ingredient(tbsp, 1.0)]
+    )
+    list_id = await _create_shopping_list(mealie_http, "Test NoAutoMerge List")
+    try:
+        async with Client(mcp_server) as mcp:
+            result = await mcp.call_tool(
+                "replace_shopping_list_from_recipes",
+                {
+                    "list_id": list_id,
+                    "recipe_ids": [recipe_a["slug"], recipe_b["slug"]],
+                    "merge_duplicates": False,
+                },
+            )
+        text = result.content[0].text
+        assert "Consolidated" not in text
+
+        items = await _list_items(mealie_http, list_id)
+        assert len(items) == 2
+    finally:
+        await _delete_recipe(mealie_http, recipe_a["slug"])
+        await _delete_recipe(mealie_http, recipe_b["slug"])
+        await _delete_shopping_list(mealie_http, list_id)
+
+
 async def test_replace_shopping_list_include_optional_flag(mcp_server, mealie_http):
     """include_optional=True keeps all ingredients including optional ones."""
     food_req = await _get_or_create_food(mealie_http, "Test Req Beef Opt Flag")

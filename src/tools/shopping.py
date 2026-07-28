@@ -23,6 +23,164 @@ _UUID_RE = re.compile(
 )
 
 
+async def _merge_duplicate_items(
+    client: httpx.AsyncClient, all_items: list[dict], dry_run: bool
+) -> tuple[list[str], int, int, int, list[str]]:
+    """
+    Merge shopping list items that reference the same food across convertible
+    units (e.g. teaspoons + tablespoons of garlic) into one summed line item.
+
+    Shared by normalize_shopping_list and replace_shopping_list_from_recipes so
+    both apply identical merge logic.
+
+    Returns (merge_lines, merged_count, updated_count, deleted_count, review_lines).
+    Items with no food reference, null quantities, or units spanning multiple
+    measurement families are left untouched and reported in review_lines.
+    """
+    food_groups: dict[str, list[dict]] = {}
+    for item in all_items:
+        food = item.get("food") or {}
+        food_id = food.get("id") if isinstance(food, dict) else None
+        if food_id:
+            food_groups.setdefault(food_id, []).append(item)
+
+    to_update: list[dict] = []
+    to_delete: list[str] = []
+    review_lines: list[str] = []
+    merge_lines: list[str] = []
+    merged_count = 0
+
+    for _food_id, items in food_groups.items():
+        if len(items) < 2:
+            continue
+
+        food_name = (items[0].get("food") or {}).get("name", _food_id)
+
+        # Bucket each item into its unit family.
+        family_groups: dict[str, list[dict]] = {}
+        unclassified: list[dict] = []
+        for item in items:
+            unit_obj = item.get("unit") or {}
+            unit_name = unit_obj.get("name", "") if isinstance(unit_obj, dict) else ""
+            canonical = normalize_unit(unit_name) if unit_name else ""
+            fam_info = unit_family_and_factor(canonical) if canonical else None
+            if fam_info:
+                family_groups.setdefault(fam_info[0], []).append(item)
+            else:
+                unclassified.append(item)
+
+        # Flag foods that span multiple families — can't auto-merge.
+        if len(family_groups) > 1 or (family_groups and unclassified):
+            parts = [f"{len(v)} × {k}" for k, v in family_groups.items()]
+            if unclassified:
+                parts.append(f"{len(unclassified)} × (count/no unit)")
+            review_lines.append(
+                f"  '{food_name}': mixed families ({', '.join(parts)}) — merge manually"
+            )
+
+        # Merge within each single convertible family that has 2+ items.
+        for family, fam_items in family_groups.items():
+            if len(fam_items) < 2:
+                continue
+
+            if any(i.get("quantity") is None for i in fam_items):
+                review_lines.append(
+                    f"  '{food_name}' ({family}): some quantities are null — skipped"
+                )
+                continue
+
+            # Pick target unit: most-used by count; tie-break = larger factor.
+            unit_counts: dict[str, int] = {}
+            for item in fam_items:
+                u = (item.get("unit") or {}).get("name", "")
+                can = normalize_unit(u) if u else ""
+                unit_counts[can] = unit_counts.get(can, 0) + 1
+
+            target_canonical = max(
+                unit_counts,
+                key=lambda u: (
+                    unit_counts[u],
+                    (unit_family_and_factor(u) or ("", 0.0))[1],
+                ),
+            )
+            target_factor = (unit_family_and_factor(target_canonical) or ("", 1.0))[1]
+
+            # Preserve the full unit object so Mealie keeps all its fields.
+            target_unit_obj: dict | None = next(
+                (
+                    item.get("unit")
+                    for item in fam_items
+                    if normalize_unit((item.get("unit") or {}).get("name", ""))
+                    == target_canonical
+                ),
+                None,
+            )
+
+            # Sum in base units then convert back to target.
+            total_base = 0.0
+            for item in fam_items:
+                qty = float(item["quantity"])
+                u = (item.get("unit") or {}).get("name", "")
+                can = normalize_unit(u) if u else ""
+                factor = (unit_family_and_factor(can) or ("", 1.0))[1]
+                total_base += qty * factor
+            total_target = round(total_base / target_factor, 6)
+
+            unit_display = (
+                target_unit_obj.get("name", target_canonical)
+                if isinstance(target_unit_obj, dict)
+                else target_canonical
+            )
+            before = " + ".join(
+                f"{i.get('quantity')} {(i.get('unit') or {}).get('name', '?')}"
+                for i in fam_items
+            )
+            merge_lines.append(
+                f"  MERGE  '{food_name}': {before}  →  {total_target} {unit_display}"
+            )
+
+            # Keep the item already on the target unit (or fall back to first).
+            keep = next(
+                (
+                    i for i in fam_items
+                    if normalize_unit((i.get("unit") or {}).get("name", ""))
+                    == target_canonical
+                ),
+                fam_items[0],
+            )
+            extras = [i for i in fam_items if i["id"] != keep["id"]]
+
+            merged_count += 1
+            to_delete.extend(i["id"] for i in extras)
+            if not dry_run:
+                updated = dict(keep)
+                updated["quantity"] = total_target
+                updated["unit"] = target_unit_obj
+                to_update.append(updated)
+
+    updated_count = deleted_count = 0
+    if not dry_run:
+        for item in to_update:
+            r = await client.put(f"/api/households/shopping/items/{item['id']}", json=item)
+            if r.is_success:
+                updated_count += 1
+            else:
+                merge_lines.append(
+                    f"  WARN: update failed for item {item['id'][:8]}… — HTTP {r.status_code}"
+                )
+
+        if to_delete:
+            r = await client.request(
+                "DELETE", "/api/households/shopping/items", params={"ids": to_delete}
+            )
+            if r.is_success:
+                deleted_count = len(to_delete)
+            else:
+                merge_lines.append(f"  WARN: bulk delete returned HTTP {r.status_code}")
+
+    return merge_lines, merged_count, updated_count, deleted_count, review_lines
+
+
 def register_shopping_tools(mcp: Any, client: httpx.AsyncClient) -> None:
 
     @mcp.tool()
@@ -31,6 +189,7 @@ def register_shopping_tools(mcp: Any, client: httpx.AsyncClient) -> None:
         recipe_ids: list[str],
         scale: float = 1.0,
         include_optional: bool = False,
+        merge_duplicates: bool = True,
     ) -> str:
         """
         Replace all items in a shopping list with the ingredients from a set of recipes.
@@ -44,6 +203,12 @@ def register_shopping_tools(mcp: Any, client: httpx.AsyncClient) -> None:
           4. Unless include_optional=True, remove any items whose ingredient was
              marked optional — either by an "optional" note on the ingredient, or by
              being under a section title that starts with "Optional".
+          5. Unless merge_duplicates=False, consolidate items that reference the same
+             food but ended up in different (convertible) units across recipes — e.g.
+             garlic in teaspoons from one recipe and tablespoons from another — into a
+             single summed line item. Items spanning incompatible unit families (e.g.
+             weight vs. volume for the same food) are left as-is and listed under
+             "Needs manual review" in the output.
 
         When the same food is required in one recipe and optional in another, it is
         kept (required wins). This makes it safe to pass several recipes at once.
@@ -54,13 +219,16 @@ def register_shopping_tools(mcp: Any, client: httpx.AsyncClient) -> None:
             scale:            Serving multiplier applied to every recipe (default 1.0).
             include_optional: When True, all ingredients are added regardless of their
                               optional status. Default False skips optional ingredients.
+            merge_duplicates: When True (default), automatically consolidate duplicate
+                              ingredients across convertible units after building the
+                              list. Set False to skip and merge manually later via
+                              normalize_shopping_list.
 
         Returns:
-            Plain-text summary of how many items were cleared and how many recipes
-            were added successfully. After this call, consider running
-            normalize_shopping_list(list_id) to collapse any ingredients that
-            appear in different units across the added recipes (e.g. garlic in
-            teaspoons from one recipe and tablespoons from another).
+            Plain-text summary of how many items were cleared, how many recipes were
+            added, and any duplicate ingredients that were consolidated. If items are
+            flagged under "Needs manual review" (incompatible unit families), resolve
+            them by hand or rerun normalize_shopping_list(list_id) after adjusting units.
         """
         resp = await client.get(f"/api/households/shopping/lists/{list_id}")
         resp.raise_for_status()
@@ -148,6 +316,24 @@ def register_shopping_tools(mcp: Any, client: httpx.AsyncClient) -> None:
                         lines.append(
                             f"  WARN: could not remove optional items — HTTP {del_r.status_code}"
                         )
+
+        if merge_duplicates:
+            merge_resp = await client.get(f"/api/households/shopping/lists/{list_id}")
+            if merge_resp.is_success:
+                merge_items = merge_resp.json().get("listItems") or []
+                merge_lines, merged_count, _updated, _deleted, review_lines = (
+                    await _merge_duplicate_items(client, merge_items, dry_run=False)
+                )
+                if merged_count:
+                    lines.append(f"  Consolidated {merged_count} duplicate ingredient(s):")
+                    lines.extend(merge_lines)
+                if review_lines:
+                    lines.append("  Needs manual review:")
+                    lines.extend(review_lines)
+            else:
+                lines.append(
+                    f"  WARN: could not fetch list for duplicate merge — HTTP {merge_resp.status_code}"
+                )
 
         lines.append("\n=== Done ===")
         return "\n".join(lines)
@@ -430,8 +616,10 @@ def register_shopping_tools(mcp: Any, client: httpx.AsyncClient) -> None:
         items with no food reference, or items with a null quantity, are left
         untouched and listed in the "Needs manual review" section.
 
-        Run this after replace_shopping_list_from_recipes when the same
-        ingredient appears in different units across multiple recipes.
+        replace_shopping_list_from_recipes runs this automatically by default
+        (merge_duplicates=True). Use this tool directly for lists built up another
+        way — e.g. via adjust_shopping_list_items, or after replace_shopping_list_from_recipes
+        was called with merge_duplicates=False.
 
         Args:
             list_id: UUID of the shopping list to normalize.
@@ -453,150 +641,11 @@ def register_shopping_tools(mcp: Any, client: httpx.AsyncClient) -> None:
             "",
         ]
 
-        # ── 2. Group by food_id ───────────────────────────────────────────────
-        food_groups: dict[str, list[dict]] = {}
-        for item in all_items:
-            food = item.get("food") or {}
-            food_id = food.get("id") if isinstance(food, dict) else None
-            if food_id:
-                food_groups.setdefault(food_id, []).append(item)
-
-        # ── 3. Process each multi-item food group ─────────────────────────────
-        to_update: list[dict] = []
-        to_delete: list[str] = []
-        review_lines: list[str] = []
-        merged_count = 0
-
-        for _food_id, items in food_groups.items():
-            if len(items) < 2:
-                continue
-
-            food_name = (items[0].get("food") or {}).get("name", _food_id)
-
-            # Bucket each item into its unit family.
-            family_groups: dict[str, list[dict]] = {}
-            unclassified: list[dict] = []
-            for item in items:
-                unit_obj = item.get("unit") or {}
-                unit_name = unit_obj.get("name", "") if isinstance(unit_obj, dict) else ""
-                canonical = normalize_unit(unit_name) if unit_name else ""
-                fam_info = unit_family_and_factor(canonical) if canonical else None
-                if fam_info:
-                    family_groups.setdefault(fam_info[0], []).append(item)
-                else:
-                    unclassified.append(item)
-
-            # Flag foods that span multiple families — can't auto-merge.
-            if len(family_groups) > 1 or (family_groups and unclassified):
-                parts = [f"{len(v)} × {k}" for k, v in family_groups.items()]
-                if unclassified:
-                    parts.append(f"{len(unclassified)} × (count/no unit)")
-                review_lines.append(
-                    f"  '{food_name}': mixed families ({', '.join(parts)}) — merge manually"
-                )
-
-            # Merge within each single convertible family that has 2+ items.
-            for family, fam_items in family_groups.items():
-                if len(fam_items) < 2:
-                    continue
-
-                if any(i.get("quantity") is None for i in fam_items):
-                    review_lines.append(
-                        f"  '{food_name}' ({family}): some quantities are null — skipped"
-                    )
-                    continue
-
-                # Pick target unit: most-used by count; tie-break = larger factor.
-                unit_counts: dict[str, int] = {}
-                for item in fam_items:
-                    u = (item.get("unit") or {}).get("name", "")
-                    can = normalize_unit(u) if u else ""
-                    unit_counts[can] = unit_counts.get(can, 0) + 1
-
-                target_canonical = max(
-                    unit_counts,
-                    key=lambda u: (
-                        unit_counts[u],
-                        (unit_family_and_factor(u) or ("", 0.0))[1],
-                    ),
-                )
-                target_factor = (unit_family_and_factor(target_canonical) or ("", 1.0))[1]
-
-                # Preserve the full unit object so Mealie keeps all its fields.
-                target_unit_obj: dict | None = next(
-                    (
-                        item.get("unit")
-                        for item in fam_items
-                        if normalize_unit((item.get("unit") or {}).get("name", ""))
-                        == target_canonical
-                    ),
-                    None,
-                )
-
-                # Sum in base units then convert back to target.
-                total_base = 0.0
-                for item in fam_items:
-                    qty = float(item["quantity"])
-                    u = (item.get("unit") or {}).get("name", "")
-                    can = normalize_unit(u) if u else ""
-                    factor = (unit_family_and_factor(can) or ("", 1.0))[1]
-                    total_base += qty * factor
-                total_target = round(total_base / target_factor, 6)
-
-                unit_display = (
-                    target_unit_obj.get("name", target_canonical)
-                    if isinstance(target_unit_obj, dict)
-                    else target_canonical
-                )
-                before = " + ".join(
-                    f"{i.get('quantity')} {(i.get('unit') or {}).get('name', '?')}"
-                    for i in fam_items
-                )
-                lines.append(
-                    f"  MERGE  '{food_name}': {before}  →  {total_target} {unit_display}"
-                )
-
-                # Keep the item already on the target unit (or fall back to first).
-                keep = next(
-                    (
-                        i for i in fam_items
-                        if normalize_unit((i.get("unit") or {}).get("name", ""))
-                        == target_canonical
-                    ),
-                    fam_items[0],
-                )
-                extras = [i for i in fam_items if i["id"] != keep["id"]]
-
-                merged_count += 1
-                to_delete.extend(i["id"] for i in extras)
-                if not dry_run:
-                    updated = dict(keep)
-                    updated["quantity"] = total_target
-                    updated["unit"] = target_unit_obj
-                    to_update.append(updated)
-
-        # ── 4. Apply changes ──────────────────────────────────────────────────
-        updated_count = deleted_count = 0
-        if not dry_run:
-            for item in to_update:
-                r = await client.put(
-                    f"/api/households/shopping/items/{item['id']}", json=item
-                )
-                if r.is_success:
-                    updated_count += 1
-                else:
-                    lines.append(
-                        f"  WARN: update failed for item {item['id'][:8]}… — HTTP {r.status_code}"
-                    )
-
-            if to_delete:
-                r = await client.request(
-                    "DELETE", "/api/households/shopping/items", params={"ids": to_delete}
-                )
-                if r.is_success:
-                    deleted_count = len(to_delete)
-                else:
-                    lines.append(f"  WARN: bulk delete returned HTTP {r.status_code}")
+        # ── 2-4. Group, merge within convertible unit families, apply changes ──
+        merge_lines, merged_count, updated_count, deleted_count, review_lines = (
+            await _merge_duplicate_items(client, all_items, dry_run)
+        )
+        lines.extend(merge_lines)
 
         suffix = (
             f" · {updated_count} updated · {deleted_count} deleted"
