@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import contextvars
 import logging
+import time
 from collections.abc import Generator
 
 import httpx
@@ -25,6 +26,13 @@ logger = logging.getLogger("mealie-mcp")
 
 # Holds the Mealie API token for the duration of a single MCP request.
 _request_token: contextvars.ContextVar[str] = contextvars.ContextVar("request_token", default="")
+
+# Retry policy for the startup OpenAPI spec fetch: Mealie may still be booting
+# (e.g. on NAS/homelab restart ordering) or briefly unreachable on the network.
+# Exponential backoff capped at STARTUP_BACKOFF_CAP, ~3 minutes total across all attempts.
+STARTUP_MAX_ATTEMPTS = 8
+STARTUP_BACKOFF_BASE = 2.0
+STARTUP_BACKOFF_CAP = 30.0
 
 
 class _ForwardedBearerAuth(httpx.Auth):
@@ -60,15 +68,45 @@ class TokenForwardMiddleware(Middleware):
 
 
 def fetch_openapi_spec(settings: Settings) -> dict:
-    """Pull the OpenAPI spec from the running Mealie instance."""
+    """Pull the OpenAPI spec from the running Mealie instance.
+
+    Retries transient connection failures (Mealie unreachable/still starting)
+    with exponential backoff, so the process doesn't crash-loop while waiting
+    for Mealie to come up. HTTP error responses (e.g. bad auth token) are
+    treated as a config problem and fail immediately without retrying.
+    """
     logger.info("Fetching OpenAPI spec from %s", settings.openapi_url)
     # Use the static token (if configured) just to fetch the spec at startup.
     headers = {}
     if settings.mealie_api_token:
         headers["Authorization"] = f"Bearer {settings.mealie_api_token}"
-    resp = httpx.get(settings.openapi_url, headers=headers, timeout=30.0)
-    resp.raise_for_status()
-    return resp.json()
+
+    for attempt in range(1, STARTUP_MAX_ATTEMPTS + 1):
+        try:
+            resp = httpx.get(settings.openapi_url, headers=headers, timeout=30.0)
+            resp.raise_for_status()
+            return resp.json()
+        except httpx.TransportError as exc:
+            if attempt == STARTUP_MAX_ATTEMPTS:
+                logger.error(
+                    "Failed to reach Mealie at %s after %d attempts: %s",
+                    settings.openapi_url,
+                    attempt,
+                    exc,
+                )
+                raise
+            delay = min(STARTUP_BACKOFF_BASE * (2 ** (attempt - 1)), STARTUP_BACKOFF_CAP)
+            logger.warning(
+                "Mealie unreachable at %s (attempt %d/%d): %s — retrying in %.0fs",
+                settings.openapi_url,
+                attempt,
+                STARTUP_MAX_ATTEMPTS,
+                exc,
+                delay,
+            )
+            time.sleep(delay)
+
+    raise AssertionError("unreachable")  # loop always returns or raises
 
 
 def build_client(settings: Settings) -> httpx.AsyncClient:

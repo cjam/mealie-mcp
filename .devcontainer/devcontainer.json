@@ -6,12 +6,15 @@
     "ghcr.io/devcontainers/features/docker-in-docker:2": {
       "version": "latest",
       "moby": true
-    }
+    },
+    "ghcr.io/devcontainers/features/node:1": {},
+    "ghcr.io/anthropics/devcontainer-features/claude-code:1": {}
   },
   "forwardPorts": [8000],
   "mounts": [
-  "source=claude-code-config,target=/home/node/.claude,type=volume"
-],
+    "source=claude-config-${devcontainerId},target=/home/vscode/.claude,type=volume"
+  ],
+  "postCreateCommand": "sudo chown -R vscode:vscode /home/vscode/.claude && [ -f /home/vscode/.claude.json ] || echo '{}' > /home/vscode/.claude.json",
   "portsAttributes": {
     "8000": {
       "label": "MCP (streamable-http)",
@@ -27,7 +30,8 @@
       "extensions": [
         "ms-python.python",
         "charliermarsh.ruff",
-        "anthropic.claude-code"
+        "anthropic.claude-code",
+        "Anthropic.claude-code"
       ],
       "settings": {
         "python.defaultInterpreterPath": ".venv/bin/python"
