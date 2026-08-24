@@ -120,3 +120,62 @@ def register_planning_tools(mcp: Any, client: httpx.AsyncClient) -> None:
         lines.append(f"  Created {created}/{len(entries)} new entries")
         lines.append("\n=== Done ===")
         return "\n".join(lines)
+
+    @mcp.tool()
+    async def find_recipes_using_ingredients(ingredients: list[str], max_results: int = 5) -> str:
+        """
+        Find recipes that use one or more of the given ingredients — useful for
+        using up what's already in the fridge/pantry when building a meal plan.
+
+        Searches recipe text (name, description, ingredient lines) for each
+        ingredient and ranks matching recipes by how many of the given
+        ingredients they contain. Matches raw/unlinked ingredient text too, so
+        it works even on recipes that haven't been run through cleanup_recipe.
+
+        Don't build the whole week around these results — pick 1–2 of the
+        top matches and mix them into an otherwise normal plan.
+
+        Args:
+            ingredients: Ingredient names to search for, e.g. ["cabbage", "eggs", "chicken"].
+            max_results: Maximum number of recipes to return (default 5).
+
+        Returns:
+            Plain-text ranked list of matching recipes with slug/id and which
+            of the given ingredients each one matched.
+        """
+        terms = [i.strip() for i in ingredients if i.strip()]
+        if not terms:
+            return "No ingredients provided."
+
+        matches: dict[str, dict] = {}
+        for term in terms:
+            resp = await client.get("/api/recipes", params={"search": term, "perPage": 50})
+            resp.raise_for_status()
+            data = resp.json()
+            items = data.get("items", data) if isinstance(data, dict) else data
+            for r in items:
+                slug = r.get("slug")
+                if not slug:
+                    continue
+                entry = matches.setdefault(
+                    slug, {"name": r.get("name", slug), "id": r.get("id", ""), "matched": set()}
+                )
+                entry["matched"].add(term)
+
+        if not matches:
+            return f"No recipes found matching: {', '.join(terms)}."
+
+        ranked = sorted(
+            matches.items(), key=lambda kv: (-len(kv[1]["matched"]), kv[1]["name"])
+        )[:max_results]
+
+        lines = [f"=== Recipes matching ingredients: {', '.join(terms)} ===", ""]
+        for slug, info in ranked:
+            matched = ", ".join(sorted(info["matched"]))
+            lines.append(f"  {info['name']}  (slug: {slug}, id: {info['id']})  —  matches: {matched}")
+        lines.append("")
+        lines.append(
+            "Tip: pick 1–2 of these to use up existing ingredients rather than "
+            "basing the whole week's plan around them."
+        )
+        return "\n".join(lines)

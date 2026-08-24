@@ -44,6 +44,30 @@ async def _delete_mealplan_entry(client: httpx.AsyncClient, entry_id: str) -> No
     await client.delete(f"/api/households/mealplans/{entry_id}")
 
 
+def _note_ingredient(note_text: str) -> dict:
+    """Raw-text ingredient, as produced by URL import (no linked food/unit)."""
+    return {
+        "referenceId": None,
+        "food": None,
+        "unit": None,
+        "quantity": 0.0,
+        "note": note_text,
+        "display": note_text,
+        "title": None,
+        "originalText": note_text,
+    }
+
+
+async def _create_recipe_with_ingredients(
+    client: httpx.AsyncClient, name: str, ingredient_notes: list[str]
+) -> dict:
+    recipe = await _create_recipe(client, name)
+    recipe["recipeIngredient"] = [_note_ingredient(n) for n in ingredient_notes]
+    r = await client.put(f"/api/recipes/{recipe['slug']}", json=recipe)
+    r.raise_for_status()
+    return r.json()
+
+
 async def test_replace_week_meal_plan_accepts_slug(mcp_server, mealie_http):
     """replace_week_meal_plan resolves recipe slugs to UUIDs without error."""
     recipe = await _create_recipe(mealie_http, "Test Meal Plan Slug Recipe")
@@ -99,3 +123,52 @@ async def test_replace_week_meal_plan_warns_on_missing_slug(mcp_server, mealie_h
 
     entries = await _get_mealplans(mealie_http, week_start, "2030-01-20")
     assert len(entries) == 0
+
+
+async def test_find_recipes_using_ingredients_registered(mcp_server):
+    async with Client(mcp_server) as mcp:
+        tools = await mcp.list_tools()
+    assert "find_recipes_using_ingredients" in [t.name for t in tools]
+
+
+async def test_find_recipes_using_ingredients_ranks_by_match_count(mcp_server, mealie_http):
+    """Recipes matching more of the given ingredients rank above those matching fewer,
+    and recipes matching none are excluded."""
+    cabbage_chicken = await _create_recipe_with_ingredients(
+        mealie_http,
+        "Find-Ingredients Cabbage Chicken Skillet",
+        ["1 head cabbage", "2 chicken breasts"],
+    )
+    eggs_only = await _create_recipe_with_ingredients(
+        mealie_http, "Find-Ingredients Egg Scramble", ["3 eggs"]
+    )
+    unrelated = await _create_recipe_with_ingredients(
+        mealie_http, "Find-Ingredients Pasta Bake", ["1 lb pasta"]
+    )
+    try:
+        async with Client(mcp_server) as mcp:
+            result = await mcp.call_tool(
+                "find_recipes_using_ingredients",
+                {"ingredients": ["cabbage", "eggs", "chicken"]},
+            )
+        text = result.content[0].text
+
+        assert cabbage_chicken["slug"] in text
+        assert eggs_only["slug"] in text
+        assert unrelated["slug"] not in text
+        # The recipe matching two ingredients should be listed before the one matching one.
+        assert text.index(cabbage_chicken["slug"]) < text.index(eggs_only["slug"])
+    finally:
+        await _delete_recipe(mealie_http, cabbage_chicken["slug"])
+        await _delete_recipe(mealie_http, eggs_only["slug"])
+        await _delete_recipe(mealie_http, unrelated["slug"])
+
+
+async def test_find_recipes_using_ingredients_no_matches(mcp_server):
+    async with Client(mcp_server) as mcp:
+        result = await mcp.call_tool(
+            "find_recipes_using_ingredients",
+            {"ingredients": ["nonexistent-ingredient-xyz123"]},
+        )
+    text = result.content[0].text
+    assert "No recipes found" in text

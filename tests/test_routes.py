@@ -31,6 +31,8 @@ REQUIRED_ENDPOINTS: list[tuple[str, str]] = [
     ("post",   "/api/recipes/test-scrape-url"),
     # upload_recipe_image — base64 bridge for recipe images
     ("post",   "/api/recipes/{slug}/image"),
+    # find_recipes_using_ingredients — per-term recipe search
+    ("get",    "/api/recipes"),
 ]
 
 
